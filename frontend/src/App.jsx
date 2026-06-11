@@ -1,125 +1,103 @@
 /**
- * UNIBEN Biodiversity Pipeline — Premium React Dashboard
- * Architecture: React 18 + Vite + Tailwind CSS + Framer Motion + Recharts
- * API: FastAPI backend on http://127.0.0.1:8000
+ * UNIBEN Biodiversity Pipeline — Premium React Dashboard v2
+ *
+ * Five mandatory environmental parameters:
+ *   Temperature (°C) · Humidity (%) · Pressure (hPa) · Light (Lux) · Sound (dB)
+ *
+ * Tab 3: split-screen drag-and-drop uploader + live taxonomy table
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Thermometer, Droplets, Gauge, Zap, MapPin,
-  Activity, Send, RefreshCw, CheckCircle2,
-  XCircle, Wifi, WifiOff, Cpu, Database,
+  Thermometer, Droplets, Gauge, Sun, Volume2,
+  Activity, RefreshCw, CheckCircle2, XCircle,
+  Wifi, WifiOff, Cpu, Database, UploadCloud,
 } from 'lucide-react';
 import {
-  ResponsiveContainer, LineChart, Line,
-  Tooltip, ReferenceLine,
+  ResponsiveContainer, LineChart, Line, Tooltip,
 } from 'recharts';
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Constants                                                                  */
-/* ─────────────────────────────────────────────────────────────────────────── */
-
-const API = 'http://127.0.0.1:8000';
+const API     = 'http://127.0.0.1:8000';
 const POLL_MS = 2000;
-const DRONE_SRC =
-  'https://assets.mixkit.co/videos/preview/mixkit-forest-stream-in-the-sunlight-529-large.mp4';
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  Framer-motion variants                                                     */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
-const panelVariants = {
-  hidden: { opacity: 0, y: 20, scale: 0.97 },
+const panelV = {
+  hidden:  { opacity: 0, y: 18, scale: 0.97 },
   visible: {
     opacity: 1, y: 0, scale: 1,
     transition: { type: 'spring', stiffness: 200, damping: 22 },
   },
 };
 
-const hoverVariants = {
-  rest:  { scale: 1, boxShadow: '0 0 0px rgba(52,211,153,0)' },
-  hover: {
-    scale: 1.015,
-    boxShadow: '0 0 24px rgba(52,211,153,0.18)',
-    transition: { type: 'spring', stiffness: 300, damping: 20 },
-  },
-};
-
-const stagger = {
-  visible: { transition: { staggerChildren: 0.07 } },
-};
+const stagger = { visible: { transition: { staggerChildren: 0.06 } } };
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Custom Recharts tooltip                                                    */
+/*  Tooltip                                                                    */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
-function SparkTooltip({ active, payload }) {
+function SparkTip({ active, payload }) {
   if (!active || !payload?.length) return null;
   return (
-    <div className="glass px-2 py-1 text-xs font-grotesk text-emerald-300">
+    <div className="glass px-2 py-1 text-[10px] font-grotesk text-emerald-300">
       {Number(payload[0].value).toFixed(2)}
     </div>
   );
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Metric Card                                                                */
+/*  Metric Card — exactly 5 environmental parameters                          */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 function MetricCard({ icon: Icon, label, value, unit, history, color = '#34D399' }) {
-  const sparkData = history.map((v, i) => ({ i, v }));
+  const data = (history ?? []).map((v, i) => ({ i, v }));
 
   return (
     <motion.div
-      className="glass p-4 flex flex-col gap-2 relative overflow-hidden"
-      variants={{ ...panelVariants, ...hoverVariants }}
-      initial="hidden"
-      animate="visible"
-      whileHover="hover"
+      className="glass p-4 flex flex-col gap-2 relative overflow-hidden cursor-default"
+      variants={panelV}
+      whileHover={{
+        scale: 1.015,
+        boxShadow: `0 0 28px ${color}30`,
+        transition: { type: 'spring', stiffness: 300, damping: 20 },
+      }}
     >
-      {/* Subtle gradient accent */}
+      {/* Glow accent */}
       <div
-        className="absolute inset-0 rounded-2xl opacity-5 pointer-events-none"
-        style={{ background: `radial-gradient(circle at 80% 20%, ${color}, transparent 60%)` }}
+        className="absolute inset-0 rounded-2xl opacity-[0.04] pointer-events-none"
+        style={{ background: `radial-gradient(circle at 80% 20%, ${color}, transparent 65%)` }}
       />
 
       {/* Header */}
       <div className="flex items-center gap-2">
-        <div
-          className="p-1.5 rounded-lg"
-          style={{ background: `${color}18` }}
-        >
-          <Icon size={14} style={{ color }} />
+        <div className="p-1.5 rounded-lg" style={{ background: `${color}18` }}>
+          <Icon size={13} style={{ color }} />
         </div>
-        <span className="text-xs font-jakarta text-gray-400 uppercase tracking-wider">{label}</span>
+        <span className="text-[10px] font-jakarta text-gray-500 uppercase tracking-widest">
+          {label}
+        </span>
       </div>
 
       {/* Value */}
       <div className="flex items-end gap-1">
-        <span
-          className="font-grotesk text-2xl font-bold leading-none"
-          style={{ color }}
-        >
+        <span className="font-grotesk text-[1.6rem] font-bold leading-none" style={{ color }}>
           {value ?? '—'}
         </span>
-        <span className="text-xs text-gray-500 mb-0.5">{unit}</span>
+        <span className="text-[10px] text-gray-600 mb-0.5 font-grotesk">{unit}</span>
       </div>
 
       {/* Sparkline */}
-      {sparkData.length > 1 && (
-        <div className="h-10 w-full mt-1">
+      {data.length > 1 && (
+        <div className="h-9 w-full mt-0.5">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={sparkData}>
-              <Line
-                type="monotone"
-                dataKey="v"
-                stroke={color}
-                strokeWidth={1.5}
-                dot={false}
-                isAnimationActive={false}
-              />
-              <Tooltip content={<SparkTooltip />} />
+            <LineChart data={data}>
+              <Line type="monotone" dataKey="v" stroke={color} strokeWidth={1.5}
+                dot={false} isAnimationActive={false} />
+              <Tooltip content={<SparkTip />} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -132,89 +110,90 @@ function MetricCard({ icon: Icon, label, value, unit, history, color = '#34D399'
 /*  Status Pill                                                                */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
-function StatusPill({ ok, label }) {
+function Pill({ ok, label }) {
   return (
-    <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-jakarta font-medium
-      ${ok ? 'bg-emerald-900/30 text-emerald-400 border border-emerald-800/40'
-           : 'bg-red-900/30 text-red-400 border border-red-800/40'}`}
-    >
-      {ok ? <CheckCircle2 size={11} /> : <XCircle size={11} />}
+    <div className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px]
+      font-jakarta font-semibold border
+      ${ok ? 'bg-emerald-900/25 text-emerald-400 border-emerald-800/35'
+           : 'bg-red-900/25 text-red-400 border-red-800/35'}`}>
+      {ok ? <CheckCircle2 size={10} /> : <XCircle size={10} />}
       {label}
     </div>
   );
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab 1 — Live Telemetry                                                     */
+/*  Tab 1 — Live Telemetry (5 parameters only)                                */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 function TelemetryTab({ readings }) {
-  const latest = readings[0] ?? {};
-  const history = (field) => readings.slice(0, 20).map((r) => r[field] ?? null).reverse();
+  const latest  = readings[0] ?? {};
+  const hist    = (field) => readings.slice(0, 25).map((r) => r[field] ?? null).reverse();
 
-  const metrics = [
-    { icon: Thermometer, label: 'Temperature', field: 'temperature_c',    unit: '°C',  color: '#f97316' },
-    { icon: Droplets,    label: 'Humidity',    field: 'humidity_percent', unit: '%',   color: '#38bdf8' },
-    { icon: Gauge,       label: 'Altitude',    field: 'altitude_m',       unit: 'm',   color: '#a78bfa' },
-    { icon: MapPin,      label: 'Latitude',    field: 'latitude',         unit: '°',   color: '#34D399' },
-    { icon: Zap,         label: 'Longitude',   field: 'longitude',        unit: '°',   color: '#facc15' },
+  const METRICS = [
+    { icon: Thermometer, label: 'Temperature',   field: 'temperature_c',    unit: '°C',  color: '#f97316' },
+    { icon: Droplets,    label: 'Humidity',      field: 'humidity_percent', unit: '%',   color: '#38bdf8' },
+    { icon: Gauge,       label: 'Pressure',      field: 'pressure_hPa',     unit: 'hPa', color: '#a78bfa' },
+    { icon: Sun,         label: 'Light',         field: 'light_lux',        unit: 'Lux', color: '#facc15' },
+    { icon: Volume2,     label: 'Sound Level',   field: 'sound_db',         unit: 'dB',  color: '#34D399' },
   ];
 
   return (
     <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-5">
       {/* Device badge */}
       {latest.device_id && (
-        <motion.div variants={panelVariants} className="flex items-center gap-2">
-          <Cpu size={14} className="text-emerald-400" />
-          <span className="font-grotesk text-xs text-emerald-300 tracking-widest uppercase">
+        <motion.div variants={panelV} className="flex items-center gap-2">
+          <Cpu size={13} className="text-emerald-400" />
+          <span className="font-grotesk text-[10px] text-emerald-300 uppercase tracking-widest">
             {latest.device_id}
           </span>
-          <span className="text-xs text-gray-600">·</span>
-          <span className="text-xs text-gray-500 font-jakarta">
+          <span className="text-gray-700 text-xs">·</span>
+          <span className="font-jakarta text-[10px] text-gray-500">
             {latest.observed_at ? new Date(latest.observed_at).toLocaleTimeString() : '—'}
           </span>
         </motion.div>
       )}
 
-      {/* Metric cards grid */}
+      {/* 5-column metric grid */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        {metrics.map((m) => (
+        {METRICS.map((m) => (
           <MetricCard
             key={m.field}
             icon={m.icon}
             label={m.label}
             value={latest[m.field] != null ? Number(latest[m.field]).toFixed(2) : '—'}
             unit={m.unit}
-            history={history(m.field)}
+            history={hist(m.field)}
             color={m.color}
           />
         ))}
       </div>
 
-      {/* Recent payloads table */}
-      {readings.length > 0 && (
-        <motion.div variants={panelVariants} className="glass p-4">
-          <p className="font-jakarta text-xs text-gray-500 uppercase tracking-widest mb-3">
-            Recent Payloads
+      {/* Recent readings table */}
+      {readings.length > 0 ? (
+        <motion.div variants={panelV} className="glass p-4">
+          <p className="font-jakarta text-[10px] text-gray-600 uppercase tracking-widest mb-3">
+            Recent Sensor Packets
           </p>
           <div className="overflow-x-auto">
-            <table className="w-full text-xs font-grotesk">
+            <table className="w-full text-[11px] font-grotesk">
               <thead>
                 <tr className="text-gray-600 border-b border-emerald-900/20">
-                  {['ID', 'Device', 'Temp (°C)', 'Humidity (%)', 'Lat', 'Lon', 'Observed At'].map((h) => (
+                  {['ID','Device','Temp °C','Humid %','Pres hPa','Light Lux','Sound dB','Observed'].map(h => (
                     <th key={h} className="text-left py-2 pr-4 font-medium">{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {readings.slice(0, 8).map((r) => (
-                  <tr key={r.id} className="border-b border-emerald-950/30 hover:bg-emerald-900/10 transition-colors">
+                {readings.slice(0, 10).map((r) => (
+                  <tr key={r.id} className="border-b border-emerald-950/20 hover:bg-emerald-900/10 transition-colors">
                     <td className="py-2 pr-4 text-emerald-400">#{r.id}</td>
                     <td className="py-2 pr-4 text-gray-300">{r.device_id}</td>
                     <td className="py-2 pr-4 text-orange-300">{r.temperature_c?.toFixed(1)}</td>
                     <td className="py-2 pr-4 text-sky-300">{r.humidity_percent?.toFixed(1)}</td>
-                    <td className="py-2 pr-4 text-gray-400">{r.latitude?.toFixed(4)}</td>
-                    <td className="py-2 pr-4 text-gray-400">{r.longitude?.toFixed(4)}</td>
+                    <td className="py-2 pr-4 text-violet-300">{r.pressure_hPa?.toFixed(1)}</td>
+                    <td className="py-2 pr-4 text-yellow-300">{r.light_lux?.toFixed(0)}</td>
+                    <td className="py-2 pr-4 text-emerald-300">{r.sound_db?.toFixed(1)}</td>
                     <td className="py-2 pr-4 text-gray-500">
                       {r.observed_at ? new Date(r.observed_at).toLocaleString() : '—'}
                     </td>
@@ -224,12 +203,10 @@ function TelemetryTab({ readings }) {
             </table>
           </div>
         </motion.div>
-      )}
-
-      {readings.length === 0 && (
-        <motion.div variants={panelVariants} className="glass p-8 text-center">
-          <Activity size={32} className="text-emerald-800 mx-auto mb-2" />
-          <p className="text-gray-500 font-jakarta text-sm">
+      ) : (
+        <motion.div variants={panelV} className="glass p-8 text-center">
+          <Activity size={30} className="text-emerald-900 mx-auto mb-2" />
+          <p className="text-gray-600 font-jakarta text-sm">
             No sensor readings yet. Start the backend and submit a payload.
           </p>
         </motion.div>
@@ -239,146 +216,128 @@ function TelemetryTab({ readings }) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab 2 — Payload Ingestion Form                                             */
+/*  Tab 2 — Payload Ingestion (5 parameters)                                  */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 const DEFAULT_FORM = {
-  device_id: 'ESP32-UNIT-001',
-  temperature_c: '27.0',
+  device_id:        'ESP32-UNIT-001',
+  temperature_c:    '27.0',
   humidity_percent: '72.0',
-  latitude: '6.335000',
-  longitude: '5.603700',
-  altitude_m: '0.0',
-  notes: '',
+  pressure_hPa:     '1013.25',
+  light_lux:        '850.0',
+  sound_db:         '42.0',
+  latitude:         '6.335000',
+  longitude:        '5.603700',
+  notes:            '',
 };
 
-function FormField({ label, name, value, onChange, type = 'text', step }) {
+function Field({ label, name, value, onChange, type = 'text', step }) {
   return (
     <div className="flex flex-col gap-1">
-      <label className="text-xs font-jakarta text-gray-400 uppercase tracking-wider">{label}</label>
-      <input
-        type={type}
-        name={name}
-        value={value}
-        onChange={onChange}
-        step={step}
-        autoComplete="off"
-      />
+      <label className="text-[10px] font-jakarta text-gray-500 uppercase tracking-wider">{label}</label>
+      <input type={type} name={name} value={value} onChange={onChange} step={step} autoComplete="off" />
     </div>
   );
 }
 
-function IngestionTab({ onSubmitSuccess }) {
-  const [form, setForm] = useState(DEFAULT_FORM);
-  const [status, setStatus] = useState(null); // 'loading' | 'success' | 'error'
+function IngestionTab({ onSuccess }) {
+  const [form,   setForm]   = useState(DEFAULT_FORM);
+  const [st,     setSt]     = useState(null);
   const [result, setResult] = useState(null);
 
-  const handleChange = (e) =>
-    setForm((f) => ({ ...f, [e.target.name]: e.target.value }));
+  const change = (e) => setForm(f => ({ ...f, [e.target.name]: e.target.value }));
 
-  const handleSubmit = async (e) => {
+  const submit = async (e) => {
     e.preventDefault();
-    setStatus('loading');
-    setResult(null);
+    setSt('loading'); setResult(null);
     try {
-      const resp = await fetch(`${API}/sensor-readings`, {
+      const r = await fetch(`${API}/sensor-readings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           device_id:        form.device_id.trim(),
           temperature_c:    parseFloat(form.temperature_c),
           humidity_percent: parseFloat(form.humidity_percent),
+          pressure_hPa:     parseFloat(form.pressure_hPa),
+          light_lux:        parseFloat(form.light_lux),
+          sound_db:         parseFloat(form.sound_db),
           latitude:         parseFloat(form.latitude),
           longitude:        parseFloat(form.longitude),
-          altitude_m:       parseFloat(form.altitude_m),
           notes:            form.notes.trim() || null,
         }),
       });
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail ?? resp.statusText);
-      setResult(data);
-      setStatus('success');
-      onSubmitSuccess?.();
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail ?? r.statusText);
+      setResult(data); setSt('success'); onSuccess?.();
     } catch (err) {
-      setResult({ error: err.message });
-      setStatus('error');
+      setResult({ error: err.message }); setSt('error');
     }
   };
 
   return (
     <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-5">
-      <motion.form
-        variants={panelVariants}
-        className="glass p-6"
-        onSubmit={handleSubmit}
-      >
-        <p className="font-jakarta text-xs text-gray-500 uppercase tracking-widest mb-4">
-          ESP32 Sensor Payload Ingestion
+      <motion.form variants={panelV} className="glass p-6" onSubmit={submit}>
+        <p className="font-jakarta text-[10px] text-gray-600 uppercase tracking-widest mb-4">
+          5-Parameter ESP32 Sensor Payload
         </p>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-5">
-          <FormField label="Device ID"       name="device_id"        value={form.device_id}        onChange={handleChange} />
-          <FormField label="Temperature (°C)" name="temperature_c"    value={form.temperature_c}    onChange={handleChange} type="number" step="0.1" />
-          <FormField label="Humidity (%)"    name="humidity_percent" value={form.humidity_percent} onChange={handleChange} type="number" step="0.1" />
-          <FormField label="Latitude"        name="latitude"         value={form.latitude}         onChange={handleChange} type="number" step="0.000001" />
-          <FormField label="Longitude"       name="longitude"        value={form.longitude}        onChange={handleChange} type="number" step="0.000001" />
-          <FormField label="Altitude (m)"    name="altitude_m"       value={form.altitude_m}       onChange={handleChange} type="number" step="0.1" />
+        {/* Row 1 — core 5 params */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4 mb-4">
+          <Field label="Temperature (°C)"  name="temperature_c"    value={form.temperature_c}    onChange={change} type="number" step="0.1"    />
+          <Field label="Humidity (%)"      name="humidity_percent" value={form.humidity_percent} onChange={change} type="number" step="0.1"    />
+          <Field label="Pressure (hPa)"   name="pressure_hPa"     value={form.pressure_hPa}     onChange={change} type="number" step="0.01"   />
+          <Field label="Light (Lux)"       name="light_lux"        value={form.light_lux}        onChange={change} type="number" step="1"      />
+          <Field label="Sound (dB)"        name="sound_db"         value={form.sound_db}         onChange={change} type="number" step="0.1"    />
+        </div>
+
+        {/* Row 2 — metadata */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+          <Field label="Device ID"  name="device_id"  value={form.device_id}  onChange={change} />
+          <Field label="Latitude"   name="latitude"   value={form.latitude}   onChange={change} type="number" step="0.000001" />
+          <Field label="Longitude"  name="longitude"  value={form.longitude}  onChange={change} type="number" step="0.000001" />
         </div>
 
         <div className="mb-5">
-          <label className="text-xs font-jakarta text-gray-400 uppercase tracking-wider block mb-1">Notes</label>
-          <textarea
-            name="notes"
-            value={form.notes}
-            onChange={handleChange}
-            rows={3}
-            style={{ resize: 'vertical' }}
-            placeholder="Optional field observations…"
-          />
+          <label className="text-[10px] font-jakarta text-gray-500 uppercase tracking-wider block mb-1">Notes</label>
+          <textarea name="notes" value={form.notes} onChange={change} rows={2}
+            style={{ resize: 'vertical' }} placeholder="Optional field observations…" />
         </div>
 
         <motion.button
-          type="submit"
-          disabled={status === 'loading'}
-          whileHover={{ scale: 1.02, boxShadow: '0 0 20px rgba(52,211,153,0.3)' }}
+          type="submit" disabled={st === 'loading'}
+          whileHover={{ scale: 1.02, boxShadow: '0 0 20px rgba(52,211,153,0.25)' }}
           whileTap={{ scale: 0.98 }}
-          className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-jakarta font-semibold text-sm
-            text-emerald-950 transition-opacity"
-          style={{ background: 'linear-gradient(135deg, #064E3B, #34D399)' }}
+          className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-jakarta font-semibold
+            text-sm text-emerald-950"
+          style={{ background: 'linear-gradient(135deg,#064E3B,#34D399)' }}
         >
-          {status === 'loading'
-            ? <><RefreshCw size={14} className="animate-spin" /> Submitting…</>
-            : <><Send size={14} /> Submit Payload</>}
+          {st === 'loading'
+            ? <><RefreshCw size={13} className="animate-spin" /> Submitting…</>
+            : <>Submit 5-Parameter Payload</>}
         </motion.button>
       </motion.form>
 
       <AnimatePresence>
-        {status === 'success' && result && (
-          <motion.div
-            variants={panelVariants} initial="hidden" animate="visible" exit={{ opacity: 0 }}
-            className="glass p-4 border border-emerald-800/30"
-          >
+        {st === 'success' && result && (
+          <motion.div variants={panelV} initial="hidden" animate="visible" exit={{ opacity: 0 }}
+            className="glass p-4 border border-emerald-800/25">
             <div className="flex items-center gap-2 mb-2">
-              <CheckCircle2 size={14} className="text-emerald-400" />
+              <CheckCircle2 size={13} className="text-emerald-400" />
               <span className="font-jakarta text-sm text-emerald-400 font-semibold">
-                Payload accepted · Record ID #{result.id}
+                Accepted · Record #{result.id}
               </span>
             </div>
-            <pre className="text-xs font-grotesk text-gray-400 overflow-x-auto">
+            <pre className="text-[10px] font-grotesk text-gray-500 overflow-x-auto">
               {JSON.stringify(result, null, 2)}
             </pre>
           </motion.div>
         )}
-        {status === 'error' && result && (
-          <motion.div
-            variants={panelVariants} initial="hidden" animate="visible" exit={{ opacity: 0 }}
-            className="glass p-4 border border-red-800/30"
-          >
+        {st === 'error' && result && (
+          <motion.div variants={panelV} initial="hidden" animate="visible" exit={{ opacity: 0 }}
+            className="glass p-4 border border-red-800/25">
             <div className="flex items-center gap-2">
-              <XCircle size={14} className="text-red-400" />
-              <span className="font-jakarta text-sm text-red-400 font-semibold">
-                {result.error}
-              </span>
+              <XCircle size={13} className="text-red-400" />
+              <span className="font-jakarta text-sm text-red-400 font-semibold">{result.error}</span>
             </div>
           </motion.div>
         )}
@@ -388,190 +347,308 @@ function IngestionTab({ onSubmitSuccess }) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab 3 — Drone Imagery                                                      */
+/*  Tab 3 — Drone Imagery  (split-screen: uploader | taxonomy table)          */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+const TAXONOMY_KEYS = ['Kingdom','Phylum','Class','Order','Family','Genus','Species'];
+
+const RANK_COLORS = {
+  Kingdom: '#f97316',
+  Phylum:  '#facc15',
+  Class:   '#a78bfa',
+  Order:   '#38bdf8',
+  Family:  '#34D399',
+  Genus:   '#86efac',
+  Species: '#A7F3D0',
+};
+
 function DroneTab() {
+  const dropRef    = useRef(null);
+  const inputRef   = useRef(null);
+  const [dragging, setDragging]  = useState(false);
+  const [file,     setFile]      = useState(null);
+  const [preview,  setPreview]   = useState(null);
+  const [status,   setStatus]    = useState(null); // null | 'uploading' | 'success' | 'error'
+  const [taxonomy, setTaxonomy]  = useState(null); // CVInferenceResponse | null
+  const [errMsg,   setErrMsg]    = useState('');
+
+  const handleFile = (f) => {
+    if (!f) return;
+    setFile(f);
+    setTaxonomy(null);
+    setStatus(null);
+    const reader = new FileReader();
+    reader.onload = (e) => setPreview(e.target.result);
+    reader.readAsDataURL(f);
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault(); setDragging(false);
+    const f = e.dataTransfer.files?.[0];
+    if (f) handleFile(f);
+  };
+
+  const upload = async () => {
+    if (!file) return;
+    setStatus('uploading');
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const r = await fetch(`${API}/api/v1/upload-image`, { method: 'POST', body: fd });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail ?? r.statusText);
+      setTaxonomy(data);
+      setStatus('success');
+    } catch (err) {
+      setErrMsg(err.message);
+      setStatus('error');
+    }
+  };
+
+  const reset = () => {
+    setFile(null); setPreview(null);
+    setTaxonomy(null); setStatus(null); setErrMsg('');
+  };
+
   return (
     <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-4">
-      <motion.div
-        variants={{ ...panelVariants, ...hoverVariants }}
-        initial="hidden"
-        animate="visible"
-        whileHover="hover"
-        className="glass overflow-hidden"
-      >
-        {/* Header bar */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-emerald-900/20">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+        {/* ── LEFT: Drag-and-Drop Uploader ── */}
+        <motion.div variants={panelV} className="glass p-5 flex flex-col gap-4">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span className="font-jakarta text-xs font-semibold text-emerald-300 uppercase tracking-widest">
-              Live Drone Feed
+            <span className="font-jakarta text-[10px] font-semibold text-emerald-300 uppercase tracking-widest">
+              Image Upload · CV Pipeline
             </span>
           </div>
-          <span className="font-grotesk text-xs text-gray-600">
-            Photogrammetric Sync · Active
-          </span>
-        </div>
 
-        {/* Video with CV crosshair overlay */}
-        <div className="relative w-full" style={{ aspectRatio: '16/9' }}>
-          <video
-            autoPlay
-            muted
-            loop
-            playsInline
-            src={DRONE_SRC}
-            className="w-full h-full object-cover"
-          />
+          {/* Drop zone */}
+          <div
+            ref={dropRef}
+            onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={onDrop}
+            onClick={() => inputRef.current?.click()}
+            className={`relative flex flex-col items-center justify-center rounded-xl border-2
+              border-dashed cursor-pointer transition-all duration-200 min-h-[180px]
+              ${dragging
+                ? 'border-emerald-400 bg-emerald-900/20'
+                : 'border-emerald-900/40 hover:border-emerald-700/60 hover:bg-emerald-900/10'}`}
+          >
+            <input
+              ref={inputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/tiff,image/webp"
+              className="hidden"
+              onChange={(e) => handleFile(e.target.files?.[0])}
+            />
 
-          {/* Crosshair overlay */}
-          <div className="absolute inset-0 pointer-events-none">
-            {/* Horizontal line */}
-            <div className="crosshair-h opacity-60" />
-            {/* Vertical line */}
-            <div className="crosshair-v opacity-60" />
-            {/* Center dot */}
-            <div className="crosshair-dot" />
-
-            {/* Corner brackets */}
-            {[
-              'top-4 left-4 border-t border-l',
-              'top-4 right-4 border-t border-r',
-              'bottom-4 left-4 border-b border-l',
-              'bottom-4 right-4 border-b border-r',
-            ].map((cls, i) => (
-              <div
-                key={i}
-                className={`absolute w-6 h-6 ${cls} border-emerald-400 opacity-70`}
-              />
-            ))}
-
-            {/* HUD data overlays */}
-            <div className="absolute top-3 left-1/2 -translate-x-1/2">
-              <span className="font-grotesk text-xs text-emerald-300 bg-black/50 px-2 py-0.5 rounded">
-                ALT: 42.3m · SPD: 8.2m/s · HDG: 314°
-              </span>
-            </div>
-            <div className="absolute bottom-3 right-4">
-              <span className="font-grotesk text-xs text-emerald-300 bg-black/50 px-2 py-0.5 rounded">
-                GPS: 6.3350°N · 5.6037°E
-              </span>
-            </div>
+            {preview ? (
+              <img src={preview} alt="preview" className="max-h-40 rounded-lg object-contain" />
+            ) : (
+              <>
+                <UploadCloud size={32} className="text-emerald-800 mb-2" />
+                <p className="font-jakarta text-xs text-gray-500 text-center px-4">
+                  Drag &amp; drop a field image here, or click to browse
+                </p>
+                <p className="font-grotesk text-[10px] text-gray-700 mt-1">
+                  JPG · PNG · TIFF · WEBP
+                </p>
+              </>
+            )}
           </div>
-        </div>
 
-        {/* Footer metrics */}
-        <div className="grid grid-cols-3 gap-px bg-emerald-900/10">
-          {[
-            { label: 'Frame Rate', value: '60 fps' },
-            { label: 'Resolution', value: '4K UHD' },
-            { label: 'Coverage', value: '2.4 km²' },
-          ].map(({ label, value }) => (
-            <div key={label} className="flex flex-col items-center py-3 bg-black/20">
-              <span className="font-grotesk text-sm text-emerald-300 font-semibold">{value}</span>
-              <span className="font-jakarta text-xs text-gray-600 mt-0.5">{label}</span>
-            </div>
-          ))}
-        </div>
-      </motion.div>
-
-      {/* Pipeline status row */}
-      <motion.div variants={panelVariants} className="glass p-4">
-        <p className="font-jakarta text-xs text-gray-500 uppercase tracking-widest mb-3">
-          Processing Pipeline
-        </p>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          {[
-            { step: 'Frame Capture',      status: 'live',    pct: 100 },
-            { step: 'Geo-referencing',    status: 'live',    pct: 98  },
-            { step: 'Orthomosaic Stitch', status: 'queued',  pct: 64  },
-            { step: 'Species Detection',  status: 'pending', pct: 0   },
-          ].map(({ step, status: st, pct }) => (
-            <div key={step} className="flex flex-col gap-1.5">
-              <div className="flex justify-between text-xs">
-                <span className="font-jakarta text-gray-400">{step}</span>
-                <span className={`font-grotesk font-semibold
-                  ${st === 'live' ? 'text-emerald-400' : st === 'queued' ? 'text-yellow-400' : 'text-gray-600'}`}>
-                  {pct}%
-                </span>
-              </div>
-              <div className="h-1 bg-emerald-950/50 rounded-full overflow-hidden">
-                <motion.div
-                  className="h-full rounded-full"
-                  style={{ background: st === 'live' ? '#34D399' : st === 'queued' ? '#facc15' : '#374151' }}
-                  initial={{ width: 0 }}
-                  animate={{ width: `${pct}%` }}
-                  transition={{ duration: 1, delay: 0.3 }}
-                />
+          {file && (
+            <div className="flex items-center justify-between">
+              <span className="font-grotesk text-[10px] text-gray-500 truncate max-w-[60%]">
+                {file.name}
+              </span>
+              <div className="flex gap-2">
+                <motion.button
+                  onClick={reset}
+                  whileHover={{ scale: 1.04 }}
+                  className="px-3 py-1.5 rounded-lg text-[10px] font-jakarta font-semibold
+                    text-gray-400 border border-gray-800/50 hover:border-gray-600/50"
+                >
+                  Clear
+                </motion.button>
+                <motion.button
+                  onClick={upload}
+                  disabled={status === 'uploading'}
+                  whileHover={{ scale: 1.04, boxShadow: '0 0 16px rgba(52,211,153,0.3)' }}
+                  whileTap={{ scale: 0.97 }}
+                  className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg font-jakarta
+                    font-semibold text-[11px] text-emerald-950"
+                  style={{ background: 'linear-gradient(135deg,#064E3B,#34D399)' }}
+                >
+                  {status === 'uploading'
+                    ? <><RefreshCw size={11} className="animate-spin" /> Classifying…</>
+                    : <>Run CV Inference</>}
+                </motion.button>
               </div>
             </div>
-          ))}
-        </div>
-      </motion.div>
+          )}
+
+          {status === 'error' && (
+            <div className="flex items-center gap-2 text-red-400">
+              <XCircle size={13} />
+              <span className="font-jakarta text-xs">{errMsg}</span>
+            </div>
+          )}
+        </motion.div>
+
+        {/* ── RIGHT: Taxonomy Results Table ── */}
+        <motion.div variants={panelV} className="glass p-5 flex flex-col gap-4">
+          <div className="flex items-center justify-between">
+            <span className="font-jakarta text-[10px] font-semibold text-emerald-300 uppercase tracking-widest">
+              Taxonomic Classification
+            </span>
+            {taxonomy && (
+              <span className="font-grotesk text-[10px] px-2 py-0.5 rounded-full"
+                style={{ background: 'rgba(52,211,153,0.12)', color: '#34D399' }}>
+                {(taxonomy.confidence * 100).toFixed(1)}% confidence
+              </span>
+            )}
+          </div>
+
+          {taxonomy ? (
+            <AnimatePresence>
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="flex flex-col gap-1"
+              >
+                {/* Predicted label */}
+                <div className="flex items-center gap-2 mb-2 pb-2 border-b border-emerald-900/20">
+                  <CheckCircle2 size={13} className="text-emerald-400" />
+                  <span className="font-jakarta text-xs text-emerald-300 font-semibold">
+                    {taxonomy.predicted_label}
+                  </span>
+                  <span className="font-grotesk text-[10px] text-gray-600 ml-auto">
+                    {taxonomy.status}
+                  </span>
+                </div>
+
+                {/* Taxonomy rows — Kingdom → Species */}
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="text-gray-700 border-b border-emerald-900/15">
+                      <th className="text-left py-1.5 font-jakarta font-medium pr-4">Rank</th>
+                      <th className="text-left py-1.5 font-jakarta font-medium">Taxon</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {TAXONOMY_KEYS.map((rank, i) => (
+                      <motion.tr
+                        key={rank}
+                        initial={{ opacity: 0, x: -8 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: i * 0.05 }}
+                        className="border-b border-emerald-950/20 hover:bg-emerald-900/10 transition-colors"
+                      >
+                        <td className="py-2 pr-4">
+                          <span
+                            className="font-jakarta text-[10px] font-semibold px-2 py-0.5 rounded-full"
+                            style={{
+                              color: RANK_COLORS[rank],
+                              background: `${RANK_COLORS[rank]}18`,
+                            }}
+                          >
+                            {rank}
+                          </span>
+                        </td>
+                        <td className="py-2 font-grotesk" style={{ color: RANK_COLORS[rank] }}>
+                          {taxonomy.taxonomy?.[rank] ?? '—'}
+                        </td>
+                      </motion.tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                {/* Confidence bar */}
+                <div className="mt-3">
+                  <div className="flex justify-between text-[10px] font-jakarta text-gray-600 mb-1">
+                    <span>ML Confidence</span>
+                    <span className="text-emerald-400 font-grotesk">
+                      {(taxonomy.confidence * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-emerald-950/50 overflow-hidden">
+                    <motion.div
+                      className="h-full rounded-full"
+                      style={{ background: 'linear-gradient(90deg,#064E3B,#34D399)' }}
+                      initial={{ width: 0 }}
+                      animate={{ width: `${taxonomy.confidence * 100}%` }}
+                      transition={{ duration: 0.8, ease: 'easeOut' }}
+                    />
+                  </div>
+                </div>
+              </motion.div>
+            </AnimatePresence>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center py-10">
+              <Database size={28} className="text-emerald-900 mb-2" />
+              <p className="font-jakarta text-xs text-gray-600 text-center px-4">
+                Upload a field image on the left to populate the taxonomic classification hierarchy.
+              </p>
+            </div>
+          )}
+        </motion.div>
+      </div>
     </motion.div>
   );
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Sidebar Health Panel                                                       */
+/*  Sidebar                                                                    */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 function Sidebar({ health, lastPoll }) {
-  const ok = health?.status === 'ok';
   return (
     <motion.aside
-      initial={{ x: -30, opacity: 0 }}
+      initial={{ x: -28, opacity: 0 }}
       animate={{ x: 0, opacity: 1 }}
       transition={{ type: 'spring', stiffness: 180, damping: 22, delay: 0.1 }}
       className="glass flex flex-col gap-4 p-5 h-full"
     >
-      {/* Logo */}
-      <div className="flex items-center gap-2 mb-2">
+      <div className="flex items-center gap-2 mb-1">
         <div className="w-7 h-7 rounded-lg flex items-center justify-center"
           style={{ background: 'linear-gradient(135deg,#064E3B,#34D399)' }}>
           <span className="text-sm">🌿</span>
         </div>
         <div>
-          <p className="font-grotesk text-xs font-bold text-emerald-300 leading-tight">UNIBEN</p>
-          <p className="font-jakarta text-[10px] text-gray-600 leading-tight">Biodiversity Engine</p>
+          <p className="font-grotesk text-[11px] font-bold text-emerald-300 leading-tight">UNIBEN</p>
+          <p className="font-jakarta text-[9px] text-gray-700 leading-tight">Biodiversity Engine</p>
         </div>
       </div>
 
-      {/* System health */}
       <div>
-        <p className="font-jakarta text-[10px] text-gray-600 uppercase tracking-widest mb-2">
-          System Health
-        </p>
-        <div className="flex flex-col gap-2">
-          <StatusPill ok={!!health} label={health ? 'API Online' : 'API Offline'} />
-          <StatusPill ok={health?.database_available} label={health?.database_available ? 'SQLite Ready' : 'DB Unavailable'} />
-          <StatusPill ok={health?.upload_dir_available} label="Upload Dir" />
-          <StatusPill ok={health?.models_loaded} label={health?.models_loaded ? 'Models Loaded' : 'No Models'} />
+        <p className="font-jakarta text-[9px] text-gray-700 uppercase tracking-widest mb-2">System Health</p>
+        <div className="flex flex-col gap-1.5">
+          <Pill ok={!!health}                    label={health ? 'API Active' : 'API Offline'} />
+          <Pill ok={health?.database_available}  label={health?.database_available ? 'DB Synced' : 'DB Error'} />
+          <Pill ok={health?.upload_dir_available} label="Upload Dir" />
+          <Pill ok={health?.models_loaded}        label={health?.models_loaded ? 'Models Ready' : 'No Models'} />
         </div>
       </div>
 
-      {/* DB path */}
       {health?.database_path && (
         <div>
-          <p className="font-jakarta text-[10px] text-gray-600 uppercase tracking-widest mb-1">
-            <Database size={9} className="inline mr-1" />DB Path
+          <p className="font-jakarta text-[9px] text-gray-700 uppercase tracking-widest mb-1">
+            <Database size={8} className="inline mr-1" />DB Path
           </p>
-          <p className="font-grotesk text-[10px] text-gray-500 break-all leading-relaxed">
+          <p className="font-grotesk text-[9px] text-gray-600 break-all leading-relaxed">
             {health.database_path.split(/[\\/]/).slice(-3).join('/')}
           </p>
         </div>
       )}
 
-      {/* Last poll */}
-      <div className="mt-auto">
-        <div className="flex items-center gap-1.5">
-          <RefreshCw size={9} className={`text-emerald-500 ${health ? 'animate-spin' : ''}`}
-            style={{ animationDuration: '3s' }} />
-          <span className="font-grotesk text-[10px] text-gray-600">
-            {lastPoll ? `Polled ${new Date(lastPoll).toLocaleTimeString()}` : 'Connecting…'}
-          </span>
-        </div>
+      <div className="mt-auto flex items-center gap-1.5">
+        <RefreshCw size={8} className="text-emerald-600" style={{ animationDuration: '3s' }} />
+        <span className="font-grotesk text-[9px] text-gray-700">
+          {lastPoll ? new Date(lastPoll).toLocaleTimeString() : 'Connecting…'}
+        </span>
       </div>
     </motion.aside>
   );
@@ -588,20 +665,19 @@ const TABS = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab]  = useState('telemetry');
-  const [readings,  setReadings]   = useState([]);
-  const [health,    setHealth]     = useState(null);
-  const [lastPoll,  setLastPoll]   = useState(null);
+  const [tab,      setTab]      = useState('telemetry');
+  const [readings, setReadings] = useState([]);
+  const [health,   setHealth]   = useState(null);
+  const [lastPoll, setLastPoll] = useState(null);
 
-  /* Live polling */
   const poll = useCallback(async () => {
     try {
-      const [hRes, rRes] = await Promise.all([
+      const [hR, rR] = await Promise.all([
         fetch(`${API}/health`),
         fetch(`${API}/sensor-readings?limit=50`),
       ]);
-      if (hRes.ok) setHealth(await hRes.json());
-      if (rRes.ok) setReadings(await rRes.json());
+      if (hR.ok) setHealth(await hR.json());
+      if (rR.ok) setReadings(await rR.json());
       setLastPoll(Date.now());
     } catch {
       setHealth(null);
@@ -616,11 +692,11 @@ export default function App() {
 
   return (
     <div className="relative z-10 min-h-screen flex flex-col">
-      {/* Top nav bar */}
+      {/* Header */}
       <motion.header
-        initial={{ y: -20, opacity: 0 }}
+        initial={{ y: -18, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.4 }}
+        transition={{ duration: 0.35 }}
         className="glass mx-4 mt-4 px-5 py-3 flex items-center justify-between"
         style={{ borderRadius: 14 }}
       >
@@ -628,63 +704,64 @@ export default function App() {
           <h1 className="font-grotesk text-sm font-bold text-emerald-300 tracking-wide">
             UNIBEN Biodiversity Pipeline
           </h1>
-          <p className="font-jakarta text-[11px] text-gray-500">
-            Campus-scale multimodal telemetry & imagery workspace
+          <p className="font-jakarta text-[10px] text-gray-600">
+            5-Parameter Environmental Telemetry · CV Classification · Timestamp Sync
           </p>
         </div>
         <div className="flex items-center gap-2">
           {health
-            ? <><Wifi size={13} className="text-emerald-400" /><span className="font-grotesk text-xs text-emerald-400">LIVE</span></>
-            : <><WifiOff size={13} className="text-red-400" /><span className="font-grotesk text-xs text-red-400">OFFLINE</span></>}
+            ? <><Wifi size={12} className="text-emerald-400" /><span className="font-grotesk text-[11px] text-emerald-400">LIVE</span></>
+            : <><WifiOff size={12} className="text-red-400" /><span className="font-grotesk text-[11px] text-red-400">OFFLINE</span></>}
         </div>
       </motion.header>
 
-      {/* Main layout */}
+      {/* Layout */}
       <div className="flex flex-1 gap-4 p-4 overflow-hidden">
-        {/* Sidebar */}
-        <div className="w-48 shrink-0 hidden lg:block">
+        {/* Sidebar (lg+) */}
+        <div className="w-44 shrink-0 hidden lg:block">
           <Sidebar health={health} lastPoll={lastPoll} />
         </div>
 
-        {/* Content area */}
+        {/* Main content */}
         <div className="flex-1 flex flex-col gap-4 min-w-0">
           {/* Tab bar */}
           <motion.div
-            initial={{ opacity: 0, y: -10 }}
+            initial={{ opacity: 0, y: -8 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.15 }}
+            transition={{ delay: 0.12 }}
             className="flex gap-1 glass p-1"
             style={{ borderRadius: 12 }}
           >
-            {TABS.map((tab) => (
+            {TABS.map((t) => (
               <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`flex-1 py-2 px-3 rounded-lg font-jakarta text-xs font-semibold transition-all duration-200
-                  ${activeTab === tab.id
-                    ? 'bg-emerald-900/40 text-emerald-300 shadow-inner'
-                    : 'text-gray-500 hover:text-gray-300 hover:bg-white/5'}`}
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className={`flex-1 py-2 px-3 rounded-lg font-jakarta text-[11px] font-semibold
+                  transition-all duration-200
+                  ${tab === t.id
+                    ? 'bg-emerald-900/40 text-emerald-300'
+                    : 'text-gray-600 hover:text-gray-400 hover:bg-white/5'}`}
               >
-                {tab.label}
+                {t.label}
               </button>
             ))}
           </motion.div>
 
-          {/* Tab content */}
-          <div className="flex-1 overflow-y-auto">
+          {/* Content */}
+          <div className="flex-1 overflow-y-auto pb-4">
             <AnimatePresence mode="wait">
-              {activeTab === 'telemetry' && (
-                <motion.div key="t" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              {tab === 'telemetry' && (
+                <motion.div key="tel" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
                   <TelemetryTab readings={readings} />
                 </motion.div>
               )}
-              {activeTab === 'ingestion' && (
-                <motion.div key="i" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                  <IngestionTab onSubmitSuccess={poll} />
+              {tab === 'ingestion' && (
+                <motion.div key="ing" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  <IngestionTab onSuccess={poll} />
                 </motion.div>
               )}
-              {activeTab === 'drone' && (
-                <motion.div key="d" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              {tab === 'drone' && (
+                <motion.div key="drn" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
                   <DroneTab />
                 </motion.div>
               )}
