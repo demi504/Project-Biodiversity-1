@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
@@ -421,6 +422,23 @@ app = FastAPI(
     description="Local-first API for environmental sensor data and drone image inference.",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# ---------------------------------------------------------------------------
+# CORS — allow the React Vite dev server (port 5173) and any localhost origin
+# ---------------------------------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

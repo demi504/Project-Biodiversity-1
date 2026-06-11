@@ -1,0 +1,110 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Reset & Base ─────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  background: #05070F;
+  color: #E8F5E9;
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Ambient Background Blobs ─────────────────────────────────────── */
+body::before {
+  content: '';
+  position: fixed;
+  top: -20vh;
+  left: -15vw;
+  width: 60vw;
+  height: 60vw;
+  background: radial-gradient(circle, rgba(16,185,129,0.06) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+body::after {
+  content: '';
+  position: fixed;
+  bottom: -20vh;
+  right: -15vw;
+  width: 50vw;
+  height: 50vw;
+  background: radial-gradient(circle, rgba(52,211,153,0.05) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ── Glassmorphic Panel ───────────────────────────────────────────── */
+.glass {
+  background: rgba(10, 15, 30, 0.4);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(16, 185, 129, 0.08);
+  border-radius: 16px;
+}
+
+/* ── Metric Number Font ───────────────────────────────────────────── */
+.font-grotesk { font-family: 'Space Grotesk', monospace; }
+
+/* ── Scrollbar ────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: #05070F; }
+::-webkit-scrollbar-thumb { background: #064E3B; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #34D399; }
+
+/* ── Tab active underline ─────────────────────────────────────────── */
+.tab-active {
+  color: #34D399;
+  border-bottom: 2px solid #34D399;
+}
+
+/* ── Crosshair overlay ────────────────────────────────────────────── */
+.crosshair-h, .crosshair-v {
+  position: absolute;
+  background: rgba(52, 211, 153, 0.5);
+  pointer-events: none;
+}
+.crosshair-h { width: 100%; height: 1px; top: 50%; }
+.crosshair-v { height: 100%; width: 1px; left: 50%; }
+.crosshair-dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #34D399;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 12px #34D399, 0 0 24px rgba(52,211,153,0.4);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  50%       { opacity: 0.4; transform: translate(-50%, -50%) scale(1.6); }
+}
+
+/* ── Input & button overrides ─────────────────────────────────────── */
+input, select, textarea {
+  background: rgba(5, 7, 15, 0.7) !important;
+  border: 1px solid rgba(6, 78, 59, 0.6) !important;
+  border-radius: 8px !important;
+  color: #E8F5E9 !important;
+  padding: 0.5rem 0.75rem;
+  font-family: 'Plus Jakarta Sans', sans-serif;
+  font-size: 0.875rem;
+  outline: none;
+  width: 100%;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: #34D399 !important;
+  box-shadow: 0 0 0 2px rgba(52,211,153,0.15) !important;
+}
+select option { background: #0D1520; color: #E8F5E9; }
