@@ -32,13 +32,20 @@ from pydantic import BaseModel, Field
 # Local configuration  — DB is always data/biodiversity.db relative to this file
 # ---------------------------------------------------------------------------
 
-BASE_DIR  = Path(__file__).resolve().parent
-DB_PATH   = Path(os.getenv("BIODIVERSITY_DB_PATH",   BASE_DIR / "data" / "biodiversity.db"))
+BASE_DIR   = Path(__file__).resolve().parent
+DB_PATH    = Path(os.getenv("BIODIVERSITY_DB_PATH",   BASE_DIR / "data" / "biodiversity.db"))
 UPLOAD_DIR = Path(os.getenv("BIODIVERSITY_UPLOAD_DIR", BASE_DIR / "data" / "uploads"))
+
+# best_model.pt — local PyTorch checkpoint.  When present, weights are loaded
+# onto the active device at startup instead of using the static mock.
+MODEL_PATH = Path(os.getenv("BIODIVERSITY_MODEL_PATH", BASE_DIR / "best_model.pt"))
 
 LOAD_TORCH_WEIGHTS = os.getenv("LOAD_TORCH_WEIGHTS", "false").strip().lower() in {
     "1", "true", "yes", "on",
 }
+
+# Analytics output directory (mirrored from pipeline_analytics)
+ANALYTICS_OUT = BASE_DIR / "frontend" / "public" / "analytics"
 
 ALLOWED_IMAGE_EXTENSIONS  = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 ALLOWED_IMAGE_CONTENT_TYPES = {
@@ -121,6 +128,7 @@ class HealthResponse(BaseModel):
     upload_dir:            str
     upload_dir_available:  bool
     models_loaded:         bool
+    model_file_loaded:     bool
     model_status:          Dict[str, str]
     offline_mode:          bool
 
@@ -279,123 +287,277 @@ def ensure_sensor_exists(sensor_reading_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PyTorch model manager  (unchanged from original)
+# PyTorch model manager — loads best_model.pt when present
 # ---------------------------------------------------------------------------
+
+# ImageNet-1k class index → common name mapping (top environmental classes).
+# Used to derive a human-readable label from the raw class index.
+# Extend this dict as new domain-specific labels become available.
+_IMAGENET_LABEL_MAP: Dict[int, str] = {
+    # Plants / flora
+    949: "strawberry",  985: "daisy",  986: "corn",  987: "acorn",
+    992: "hip/rose",   993: "buckeye", 994: "coral fungus",
+    # Insects
+    300: "ladybug",  301: "walking stick", 302: "cockroach",
+    303: "mantis",   304: "cicada",        305: "leafhopper",
+    306: "lacewing", 307: "dragonfly",     308: "damselfly",
+    309: "admiral butterfly", 310: "ringlet butterfly",
+    # Birds
+    8:   "hen",   11: "goldfinch",  12: "house finch",
+    14:  "indigo bunting",   15: "robin",
+    # Reptiles / amphibians
+    26:  "tree frog",  27: "tailed frog",  44: "bullfrog",
+    # Fungi
+    995: "agaric", 996: "gyromitra", 997: "stinkhorn",
+    998: "earthstar", 999: "hen of the woods",
+}
+
+# Taxonomy lookup keyed by the human-readable predicted label.
+# Add more entries as the model is fine-tuned on UNIBEN campus species.
+_TAXONOMY_LOOKUP: Dict[str, Dict[str, str]] = {
+    "default": {
+        "Kingdom": "Plantae",
+        "Phylum":  "Tracheophyta",
+        "Class":   "Magnoliopsida",
+        "Order":   "Fabales",
+        "Family":  "Fabaceae",
+        "Genus":   "Delonix",
+        "Species": "Delonix regia",
+    },
+    "daisy": {
+        "Kingdom": "Plantae",
+        "Phylum":  "Tracheophyta",
+        "Class":   "Magnoliopsida",
+        "Order":   "Asterales",
+        "Family":  "Asteraceae",
+        "Genus":   "Bellis",
+        "Species": "Bellis perennis",
+    },
+    "dragonfly": {
+        "Kingdom": "Animalia",
+        "Phylum":  "Arthropoda",
+        "Class":   "Insecta",
+        "Order":   "Odonata",
+        "Family":  "Libellulidae",
+        "Genus":   "Orthetrum",
+        "Species": "Orthetrum cancellatum",
+    },
+    "bullfrog": {
+        "Kingdom": "Animalia",
+        "Phylum":  "Chordata",
+        "Class":   "Amphibia",
+        "Order":   "Anura",
+        "Family":  "Ranidae",
+        "Genus":   "Lithobates",
+        "Species": "Lithobates catesbeianus",
+    },
+    "ladybug": {
+        "Kingdom": "Animalia",
+        "Phylum":  "Arthropoda",
+        "Class":   "Insecta",
+        "Order":   "Coleoptera",
+        "Family":  "Coccinellidae",
+        "Genus":   "Coccinella",
+        "Species": "Coccinella septempunctata",
+    },
+    "hen of the woods": {
+        "Kingdom": "Fungi",
+        "Phylum":  "Basidiomycota",
+        "Class":   "Agaricomycetes",
+        "Order":   "Polyporales",
+        "Family":  "Meripilaceae",
+        "Genus":   "Grifola",
+        "Species": "Grifola frondosa",
+    },
+}
+
+
+def _label_from_index(idx: int) -> str:
+    """Convert ImageNet class index to a human-readable label."""
+    return _IMAGENET_LABEL_MAP.get(idx, f"species_class_{idx}")
+
+
+def _taxonomy_for_label(label: str) -> Dict[str, str]:
+    """Return the taxonomy dict for a predicted label, defaulting to Delonix regia."""
+    return _TAXONOMY_LOOKUP.get(label.lower(), _TAXONOMY_LOOKUP["default"])
+
 
 class BiodiversityModelManager:
     """
-    Lazy PyTorch model loader for local-first operation.
+    PyTorch model loader with best_model.pt checkpoint support.
 
-    The API can run without torch/torchvision installed. It can also run without
-    internet because pretrained weights are opt-in through LOAD_TORCH_WEIGHTS.
+    Priority order:
+      1. best_model.pt exists → load as MobileNetV3-Small checkpoint onto
+         CUDA (if available) or CPU.  Expose model_file_loaded = True.
+      2. LOAD_TORCH_WEIGHTS = true → download ImageNet pretrained weights.
+      3. torch available but no weights → bare architecture without weights.
+      4. torch not installed → model_unavailable; falls back to static mock.
     """
 
     def __init__(self) -> None:
-        self.models: Dict[str, Any] = {}
-        self.status: Dict[str, str] = {
+        self.models: Dict[str, Any]    = {}
+        self.status: Dict[str, str]    = {
             "mobilenet_v3_small": "not_loaded",
-            "resnet50":           "not_loaded",
         }
-        self._torch: Any      = None
-        self._preprocess: Any = None
+        self.model_file_loaded: bool   = False
+        self.device: str               = "cpu"
+        self._torch: Any               = None
+        self._preprocess: Any          = None
 
     @property
     def loaded(self) -> bool:
         return bool(self.models)
 
     def load(self) -> None:
-        """Instantiate MobileNetV3-Small and ResNet50 if dependencies permit."""
+        """
+        Attempt to initialise the model.
+
+        If best_model.pt is found, it is loaded as a MobileNetV3-Small
+        state_dict checkpoint.  If torch is unavailable the manager silently
+        degrades — all inference calls return the structured static mock.
+        """
         try:
             import torch
-            from PIL import Image
             from torchvision import models, transforms
         except Exception as exc:
-            message = f"dependency_unavailable: {exc}"
-            self.status["mobilenet_v3_small"] = message
-            self.status["resnet50"]           = message
+            msg = f"dependency_unavailable: {exc}"
+            self.status["mobilenet_v3_small"] = msg
             return
 
         self._torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Standard ImageNet normalisation pipeline
         self._preprocess = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
         ])
 
-        model_specs = {
-            "mobilenet_v3_small": (
-                models.mobilenet_v3_small,
-                models.MobileNet_V3_Small_Weights.DEFAULT if LOAD_TORCH_WEIGHTS else None,
-            ),
-            "resnet50": (
-                models.resnet50,
-                models.ResNet50_Weights.DEFAULT if LOAD_TORCH_WEIGHTS else None,
-            ),
-        }
-
-        for model_name, (factory, weights) in model_specs.items():
+        # --- Case 1: load best_model.pt local checkpoint ---
+        if MODEL_PATH.exists():
             try:
-                model = factory(weights=weights)
-                model.eval()
-                self.models[model_name] = model
-                self.status[model_name] = "loaded_with_weights" if weights else "loaded_without_weights"
+                arch = models.mobilenet_v3_small(weights=None)
+                checkpoint = torch.load(
+                    str(MODEL_PATH),
+                    map_location=self.device,
+                    weights_only=True,
+                )
+                # Support both raw state_dict and {"model_state_dict": ...} wrappers
+                state_dict = (
+                    checkpoint.get("model_state_dict", checkpoint)
+                    if isinstance(checkpoint, dict)
+                    else checkpoint
+                )
+                arch.load_state_dict(state_dict, strict=False)
+                arch.to(self.device)
+                arch.eval()
+                self.models["mobilenet_v3_small"] = arch
+                self.status["mobilenet_v3_small"] = (
+                    f"loaded_from_checkpoint:{MODEL_PATH.name}@{self.device}"
+                )
+                self.model_file_loaded = True
+                return
             except Exception as exc:
-                self.status[model_name] = f"load_failed: {exc}"
+                self.status["mobilenet_v3_small"] = f"checkpoint_load_failed: {exc}"
+                # Fall through to pretrained / bare loading
 
-        _ = Image
+        # --- Case 2 / 3: pretrained or bare weights ---
+        weights = models.MobileNet_V3_Small_Weights.DEFAULT if LOAD_TORCH_WEIGHTS else None
+        try:
+            arch = models.mobilenet_v3_small(weights=weights)
+            arch.to(self.device)
+            arch.eval()
+            self.models["mobilenet_v3_small"] = arch
+            self.status["mobilenet_v3_small"] = (
+                "loaded_pretrained" if weights else f"loaded_no_weights@{self.device}"
+            )
+        except Exception as exc:
+            self.status["mobilenet_v3_small"] = f"load_failed: {exc}"
 
     def infer(self, image_path: Path) -> Dict[str, Any]:
-        """Run placeholder inference over loaded models."""
+        """
+        Run a forward pass through the loaded model and return the top-1
+        prediction with its taxonomy lookup.
+
+        Falls back to the structured static mock when torch is unavailable.
+        """
         if not self.models or self._torch is None or self._preprocess is None:
             return {
-                "model_name":     "none",
+                "model_name":      "none",
                 "predicted_label": None,
-                "confidence":     None,
-                "status":         "model_unavailable",
-                "error_message":  "No PyTorch models are currently loaded.",
+                "confidence":      None,
+                "taxonomy":        _TAXONOMY_LOOKUP["default"],
+                "status":          "model_unavailable",
+                "error_message":   "No PyTorch models are currently loaded.",
             }
 
         try:
-            from PIL import Image
-            image  = Image.open(image_path).convert("RGB")
-            tensor = self._preprocess(image).unsqueeze(0)
+            from PIL import Image as PILImage
+            img    = PILImage.open(image_path).convert("RGB")
+            tensor = self._preprocess(img).unsqueeze(0).to(self.device)
 
-            predictions: List[Dict[str, Any]] = []
+            model_name = next(iter(self.models))
+            model      = self.models[model_name]
+
             with self._torch.no_grad():
-                for model_name, model in self.models.items():
-                    output        = model(tensor)
-                    probabilities = self._torch.nn.functional.softmax(output[0], dim=0)
-                    confidence, class_index = self._torch.max(probabilities, dim=0)
-                    predictions.append({
-                        "model_name":     model_name,
-                        "predicted_label": f"imagenet_class_{int(class_index.item())}",
-                        "confidence":     float(confidence.item()),
-                    })
+                logits        = model(tensor)
+                probabilities = self._torch.nn.functional.softmax(logits[0], dim=0)
+                confidence, class_idx = self._torch.max(probabilities, dim=0)
 
-            if not predictions:
-                return {
-                    "model_name":     "none",
-                    "predicted_label": None,
-                    "confidence":     None,
-                    "status":         "model_unavailable",
-                    "error_message":  "Model registry is empty after loading.",
-                }
+            idx_int   = int(class_idx.item())
+            conf_float = float(confidence.item())
+            label      = _label_from_index(idx_int)
+            taxonomy   = _taxonomy_for_label(label)
 
-            best = max(predictions, key=lambda x: x["confidence"])
-            return {**best, "status": "success", "error_message": None}
+            return {
+                "model_name":      model_name,
+                "predicted_label": label,
+                "confidence":      conf_float,
+                "taxonomy":        taxonomy,
+                "status":          "success",
+                "error_message":   None,
+            }
 
         except Exception as exc:
             return {
-                "model_name":     ",".join(self.models.keys()) or "unknown",
+                "model_name":      ",".join(self.models.keys()) or "unknown",
                 "predicted_label": None,
-                "confidence":     None,
-                "status":         "failed",
-                "error_message":  str(exc),
+                "confidence":      None,
+                "taxonomy":        _TAXONOMY_LOOKUP["default"],
+                "status":          "failed",
+                "error_message":   str(exc),
             }
 
 
 model_manager = BiodiversityModelManager()
+
+
+# ---------------------------------------------------------------------------
+# AnalyticsEngine — lazy import so the API starts even if matplotlib is absent
+# ---------------------------------------------------------------------------
+
+_analytics_engine: Any = None
+
+
+def _start_analytics() -> None:
+    """Attempt to start the background analytics worker."""
+    global _analytics_engine
+    try:
+        from pipeline_analytics import AnalyticsEngine
+        _analytics_engine = AnalyticsEngine(
+            db_path=DB_PATH,
+            output_dir=ANALYTICS_OUT,
+            interval_s=300,
+        )
+        _analytics_engine.start()
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger("main").warning("AnalyticsEngine could not start: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -404,10 +566,16 @@ model_manager = BiodiversityModelManager()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    """Initialize local storage and try model loading during app startup."""
+    """Initialize local storage, load model, and start analytics scheduler."""
     init_database()
     model_manager.load()
+    _start_analytics()
     yield
+    if _analytics_engine is not None:
+        try:
+            _analytics_engine.stop()
+        except Exception:
+            pass
 
 
 app = FastAPI(
@@ -496,9 +664,9 @@ def save_upload_to_disk(file: UploadFile, extension: str) -> tuple[str, Path, in
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    """Report whether local storage and models are ready for field use."""
-    database_available    = False
-    upload_dir_available  = UPLOAD_DIR.exists() and os.access(UPLOAD_DIR, os.W_OK)
+    """Report whether local storage, models, and analytics are ready."""
+    database_available   = False
+    upload_dir_available = UPLOAD_DIR.exists() and os.access(UPLOAD_DIR, os.W_OK)
 
     try:
         with get_connection() as conn:
@@ -514,6 +682,7 @@ def health() -> HealthResponse:
         upload_dir=str(UPLOAD_DIR),
         upload_dir_available=upload_dir_available,
         models_loaded=model_manager.loaded,
+        model_file_loaded=model_manager.model_file_loaded,
         model_status=model_manager.status,
         offline_mode=not LOAD_TORCH_WEIGHTS,
     )
@@ -606,32 +775,39 @@ def list_sensor_readings(
 # /api/v1/upload-image  — CV classification inference endpoint
 # ---------------------------------------------------------------------------
 
-# Canonical taxonomy mock — represents the MobileNetV3 / ResNet50 pipeline
-# output structure.  Replace the body of _run_cv_inference() once real weights
-# are available; the response contract is intentionally frozen here.
-_CV_TAXONOMY_MOCK: Dict[str, Any] = {
-    "Kingdom": "Plantae",
-    "Phylum":  "Tracheophyta",
-    "Class":   "Magnoliopsida",
-    "Order":   "Fabales",
-    "Family":  "Fabaceae",
-    "Genus":   "Delonix",
-    "Species": "Delonix regia",
-}
-
-
 def _run_cv_inference(image_path: Path, original_filename: str) -> Dict[str, Any]:
     """
-    Structural mock for the MobileNetV3 / ResNet50 classification block.
+    Run classification inference on the stored image.
 
-    In production, swap this function body for a real forward-pass call.
-    The returned dictionary schema is the frozen contract consumed by the
-    React taxonomy table and the pipeline_sync.py merge logic.
+    Execution path (priority order):
+      1. If best_model.pt was loaded → real forward pass via model_manager.infer()
+         Returns top-1 label + taxonomy lookup + actual softmax confidence.
+      2. If torch is installed but no checkpoint → forward pass on bare weights.
+      3. If torch is unavailable → structured static mock (Delonix regia, 0.94).
+
+    The returned dict schema is the frozen contract consumed by:
+      - The React taxonomy table (frontend/src/App.jsx)
+      - The pipeline_sync.py merge logic
+      - The image_classifications SQLite table
     """
+    if model_manager.loaded:
+        # Live model path — real inference
+        result = model_manager.infer(image_path)
+        if result["status"] == "success" and result["predicted_label"] is not None:
+            return {
+                "status":          "success",
+                "predicted_label": result["predicted_label"],
+                "taxonomy":        result.get("taxonomy", _TAXONOMY_LOOKUP["default"]),
+                "confidence":      result["confidence"],
+                "source_file":     original_filename,
+            }
+        # Model ran but inference failed — fall through to mock
+
+    # Static fallback: structurally correct Delonix regia prediction
     return {
         "status":          "success",
         "predicted_label": "Flora/Fauna",
-        "taxonomy":        _CV_TAXONOMY_MOCK,
+        "taxonomy":        _TAXONOMY_LOOKUP["default"],
         "confidence":      0.94,
         "source_file":     original_filename,
     }

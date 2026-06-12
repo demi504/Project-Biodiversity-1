@@ -7,12 +7,12 @@
  * Tab 3: split-screen drag-and-drop uploader + live taxonomy table
  */
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Thermometer, Droplets, Gauge, Sun, Volume2,
   Activity, RefreshCw, CheckCircle2, XCircle,
-  Wifi, WifiOff, Cpu, Database, UploadCloud,
+  Wifi, WifiOff, Cpu, Database, UploadCloud, BarChart2,
 } from 'lucide-react';
 import {
   ResponsiveContainer, LineChart, Line, Tooltip,
@@ -211,6 +211,109 @@ function TelemetryTab({ readings }) {
           </p>
         </motion.div>
       )}
+
+      {/* ── Data Insights & Automated Analytical Reports ── */}
+      <div className="pt-2">
+        <AnalyticsPanel />
+      </div>
+    </motion.div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Analytics Panel — renders Matplotlib PNGs from /analytics/ static path    */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+const ANALYTICS_PLOTS = [
+  {
+    src:   '/analytics/sensor_correlations.png',
+    title: '5-Parameter Sensor Correlation Matrix',
+    desc:  'Pearson correlation coefficients · auto-refreshed every 5 min',
+  },
+  {
+    src:   '/analytics/biodiversity_density.png',
+    title: 'Biodiversity Encounter Density',
+    desc:  'KDE histograms + observation frequency over time',
+  },
+];
+
+// Cache-bust key so Vite re-fetches updated PNGs after each analytics cycle
+function useCacheBust(intervalMs = 300_000) {
+  const [bust, setBust] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setBust(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return bust;
+}
+
+const AnalyticsPlotCard = memo(function AnalyticsPlotCard({ src, title, desc, bust }) {
+  const [loaded, setLoaded]   = useState(false);
+  const [errored, setErrored] = useState(false);
+
+  // Reset error/load state when src or bust changes
+  useEffect(() => { setLoaded(false); setErrored(false); }, [src, bust]);
+
+  return (
+    <motion.div
+      variants={panelV}
+      className="glass p-4 flex flex-col gap-3"
+      whileHover={{ scale: 1.008, boxShadow: '0 0 24px rgba(52,211,153,0.15)' }}
+    >
+      <div className="flex items-start gap-2">
+        <BarChart2 size={13} className="text-emerald-400 mt-0.5 shrink-0" />
+        <div>
+          <p className="font-jakarta text-[11px] font-semibold text-emerald-300 leading-tight">
+            {title}
+          </p>
+          <p className="font-grotesk text-[9px] text-gray-600 mt-0.5">{desc}</p>
+        </div>
+      </div>
+
+      <div className="relative rounded-xl overflow-hidden bg-[#0B0F19] border border-emerald-900/20"
+        style={{ minHeight: 180 }}>
+        {!loaded && !errored && (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <RefreshCw size={18} className="text-emerald-800 animate-spin" />
+          </div>
+        )}
+        {errored ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
+            <BarChart2 size={22} className="text-emerald-900" />
+            <p className="font-jakarta text-[10px] text-gray-700 text-center px-4">
+              Plot will appear after the first analytics cycle runs (≤5 min).
+            </p>
+          </div>
+        ) : (
+          <img
+            src={`${src}?v=${bust}`}
+            alt={title}
+            onLoad={() => setLoaded(true)}
+            onError={() => setErrored(true)}
+            className="w-full rounded-xl transition-opacity duration-500"
+            style={{ opacity: loaded ? 1 : 0 }}
+          />
+        )}
+      </div>
+    </motion.div>
+  );
+});
+
+function AnalyticsPanel() {
+  const bust = useCacheBust(300_000);
+  return (
+    <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-2">
+      <motion.div variants={panelV} className="flex items-center gap-2 pt-1">
+        <BarChart2 size={12} className="text-emerald-500" />
+        <span className="font-jakarta text-[9px] text-gray-600 uppercase tracking-widest">
+          Data Insights &amp; Automated Reports · Matplotlib/Seaborn · auto-refresh 5 min
+        </span>
+      </motion.div>
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+        {ANALYTICS_PLOTS.map((p) => (
+          <AnalyticsPlotCard key={p.src} {...p} bust={bust} />
+        ))}
+      </div>
     </motion.div>
   );
 }
@@ -626,10 +729,10 @@ function Sidebar({ health, lastPoll }) {
       <div>
         <p className="font-jakarta text-[9px] text-gray-700 uppercase tracking-widest mb-2">System Health</p>
         <div className="flex flex-col gap-1.5">
-          <Pill ok={!!health}                    label={health ? 'API Active' : 'API Offline'} />
-          <Pill ok={health?.database_available}  label={health?.database_available ? 'DB Synced' : 'DB Error'} />
-          <Pill ok={health?.upload_dir_available} label="Upload Dir" />
-          <Pill ok={health?.models_loaded}        label={health?.models_loaded ? 'Models Ready' : 'No Models'} />
+          <Pill ok={!!health}                      label={health ? 'API Active' : 'API Offline'} />
+          <Pill ok={health?.database_available}    label={health?.database_available ? 'DB Synced' : 'DB Error'} />
+          <Pill ok={health?.upload_dir_available}  label="Upload Dir" />
+          <Pill ok={health?.model_file_loaded}     label={health?.model_file_loaded ? 'Model Active' : 'No Checkpoint'} />
         </div>
       </div>
 
