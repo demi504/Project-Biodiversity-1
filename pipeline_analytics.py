@@ -283,6 +283,10 @@ class AnalyticsEngine:
             return {"status": "no_data"}
 
         df, clean_report = self._cleaner.clean(df_raw)
+        
+        # Run temporal matching to backfill environmental data on field_observations
+        self._temporal_matching(df)
+        
         daily_stats      = self._compute_daily_stats(df)
         corr_path        = self._plot_correlation_heatmap(df)
         dens_path        = self._plot_biodiversity_density(df)
@@ -322,6 +326,67 @@ class AnalyticsEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _temporal_matching(self, sensor_df: "pd.DataFrame") -> None:
+        """
+        Matches field_observations to the closest sensor_readings within 2 minutes.
+        Updates field_observations with the matched environmental parameters.
+        """
+        if not self.db_path.exists() or sensor_df.empty or "observed_at" not in sensor_df.columns:
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            obs_df = pd.read_sql_query("SELECT obs_id, date, time FROM field_observations WHERE ambient_temp_c IS NULL", conn)
+            if obs_df.empty:
+                return
+
+            # Parse observation datetime
+            obs_df["obs_datetime"] = pd.to_datetime(obs_df["date"] + " " + obs_df["time"], format="mixed", errors="coerce", utc=True)
+            obs_df = obs_df.dropna(subset=["obs_datetime"])
+
+            # Ensure sensor_df index is sorted
+            sensor_work = sensor_df.copy()
+            if sensor_work.index.name != "observed_at":
+                sensor_work = sensor_work.set_index("observed_at")
+            sensor_work = sensor_work.sort_index()
+
+            updates = []
+            for _, row in obs_df.iterrows():
+                obs_t = row["obs_datetime"]
+                # Find closest sensor reading
+                idx = sensor_work.index.get_indexer([obs_t], method="nearest")[0]
+                if idx == -1:
+                    continue
+                closest = sensor_work.iloc[idx]
+                time_diff = abs((closest.name - obs_t).total_seconds())
+                
+                if time_diff <= 120:  # <= 2 mins
+                    updates.append((
+                        float(closest["temperature_c"]),
+                        float(closest["humidity_percent"]),
+                        float(closest["light_lux"]),
+                        float(closest["pressure_hPa"]),
+                        float(closest["sound_db"]),
+                        row["obs_id"]
+                    ))
+
+            if updates:
+                conn.executemany(
+                    """
+                    UPDATE field_observations
+                    SET ambient_temp_c = ?, rel_humidity_pct = ?, light_lux = ?,
+                        atmospheric_pressure_hpa = ?, ambient_sound_db = ?
+                    WHERE obs_id = ?
+                    """,
+                    updates
+                )
+                conn.commit()
+                log.info("AnalyticsEngine: Temporally matched %d field_observations to sensor readings.", len(updates))
+        except Exception as e:
+            log.error("AnalyticsEngine: Error during temporal matching: %s", e)
+        finally:
+            conn.close()
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -344,7 +409,7 @@ class AnalyticsEngine:
                     id, device_id,
                     temperature_c, humidity_percent,
                     pressure_hPa,  light_lux, sound_db,
-                    observed_at, received_at, notes
+                    observed_at, received_at, notes, data_source
                 FROM sensor_readings
                 ORDER BY observed_at ASC
                 """
@@ -402,6 +467,7 @@ class AnalyticsEngine:
         """
         Generate a Seaborn heatmap of Pearson correlation coefficients
         between the five environmental sensor fields.
+        Shows side-by-side matrices for LIVE_ESP32 and MANUAL_OVERRIDE.
 
         Saved to: frontend/public/analytics/sensor_correlations.png
         """
@@ -417,44 +483,57 @@ class AnalyticsEngine:
             log.warning("Not enough sensor columns for correlation — skipping heatmap.")
             return out_path
 
-        corr = df[available].corr(method="pearson")
         labels = [FIELD_LABELS.get(f, f) for f in available]
 
-        fig, ax = plt.subplots(figsize=(9, 7))
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
         fig.patch.set_facecolor("#0B0F19")
-        ax.set_facecolor("#111823")
 
-        mask = np.triu(np.ones_like(corr, dtype=bool), k=1)  # hide upper triangle
+        sources = [("LIVE_ESP32", "Hardware (LIVE_ESP32)"), ("MANUAL_OVERRIDE", "Manual (MANUAL_OVERRIDE)")]
+        
+        for ax, (source_key, title) in zip(axes, sources):
+            ax.set_facecolor("#111823")
+            df_sub = df[df.get("data_source", "LIVE_ESP32") == source_key]
+            
+            if len(df_sub) < 2:
+                ax.text(0.5, 0.5, f"Not enough data for {source_key}", 
+                        ha="center", va="center", color="#6B7280", transform=ax.transAxes)
+                ax.set_title(title, color="#34D399", fontsize=11, fontweight="bold", pad=10)
+                ax.axis("off")
+                continue
 
-        sns.heatmap(
-            corr,
-            mask=~mask & np.eye(len(corr), dtype=bool) == False,   # noqa: E712
-            annot=True,
-            fmt=".2f",
-            cmap=sns.diverging_palette(145, 300, s=85, l=45, n=256),
-            vmin=-1.0,
-            vmax=1.0,
-            linewidths=0.5,
-            linecolor="#1a2234",
-            square=True,
-            ax=ax,
-            cbar_kws={"shrink": 0.82, "pad": 0.02},
-            xticklabels=labels,
-            yticklabels=labels,
-            annot_kws={"size": 10, "color": "white"},
+            corr = df_sub[available].corr(method="pearson")
+            mask = np.triu(np.ones_like(corr, dtype=bool), k=1)
+
+            sns.heatmap(
+                corr,
+                mask=~mask & np.eye(len(corr), dtype=bool) == False,   # noqa: E712
+                annot=True,
+                fmt=".2f",
+                cmap=sns.diverging_palette(145, 300, s=85, l=45, n=256),
+                vmin=-1.0,
+                vmax=1.0,
+                linewidths=0.5,
+                linecolor="#1a2234",
+                square=True,
+                ax=ax,
+                cbar_kws={"shrink": 0.82, "pad": 0.02},
+                xticklabels=labels,
+                yticklabels=labels,
+                annot_kws={"size": 10, "color": "white"},
+            )
+
+            ax.tick_params(colors="#9CA3AF", labelsize=9)
+            ax.set_title(title, color="#34D399", fontsize=11, fontweight="bold", pad=10)
+
+            cbar = ax.collections[0].colorbar
+            cbar.ax.yaxis.set_tick_params(color="#9CA3AF", labelsize=8)
+            plt.setp(cbar.ax.yaxis.get_ticklabels(), color="#9CA3AF")
+            cbar.set_label("Pearson r", color="#9CA3AF", fontsize=9)
+
+        fig.suptitle(
+            "UNIBEN Biodiversity · 5-Parameter Sensor Correlation Matrices by Source",
+            color="#34D399", fontsize=14, fontweight="bold", y=1.02,
         )
-
-        # Style tweaks for dark theme
-        ax.tick_params(colors="#9CA3AF", labelsize=9)
-        ax.set_title(
-            "UNIBEN Biodiversity · 5-Parameter Sensor Correlation Matrix",
-            color="#34D399", fontsize=12, fontweight="bold", pad=14,
-        )
-
-        cbar = ax.collections[0].colorbar
-        cbar.ax.yaxis.set_tick_params(color="#9CA3AF", labelsize=8)
-        plt.setp(cbar.ax.yaxis.get_ticklabels(), color="#9CA3AF")
-        cbar.set_label("Pearson r", color="#9CA3AF", fontsize=9)
 
         plt.tight_layout(pad=1.4)
         fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -503,11 +582,16 @@ class AnalyticsEngine:
             ax.set_facecolor("#111823")
 
             if len(vals) >= 2:
+                df_clean = df.dropna(subset=[field]).copy()
+                if "data_source" not in df_clean.columns:
+                    df_clean["data_source"] = "LIVE_ESP32"
                 sns.histplot(
-                    vals,
+                    data=df_clean,
+                    x=field,
+                    hue="data_source",
                     ax=ax,
                     kde=True,
-                    color=col,
+                    palette={"LIVE_ESP32": col, "MANUAL_OVERRIDE": "#f97316"},
                     alpha=0.55,
                     edgecolor="#0B0F19",
                     line_kws={"linewidth": 2},
@@ -531,26 +615,40 @@ class AnalyticsEngine:
         if "observed_at" in df.columns:
             df_time = df.copy()
             df_time["date"] = pd.to_datetime(df_time["observed_at"]).dt.date
-            counts = df_time.groupby("date").size().reset_index(name="count")
+            if "data_source" not in df_time.columns:
+                df_time["data_source"] = "LIVE_ESP32"
+                
+            counts = df_time.groupby(["date", "data_source"]).size().unstack(fill_value=0)
+            
+            # Ensure columns are present for deterministic color mapping
+            for c in ["LIVE_ESP32", "MANUAL_OVERRIDE"]:
+                if c not in counts.columns:
+                    counts[c] = 0
+            counts = counts[["LIVE_ESP32", "MANUAL_OVERRIDE"]]
+            
+            if not counts.empty and counts.sum().sum() > 0:
+                counts.plot(
+                    kind="bar",
+                    stacked=True,
+                    ax=timeline_ax,
+                    color=["#34D399", "#f97316"],
+                    edgecolor="#0B0F19",
+                    linewidth=0.5,
+                    alpha=0.75,
+                    legend=False
+                )
 
-            dates  = pd.to_datetime(counts["date"])
-            cnts   = counts["count"].values
-
-            bars = timeline_ax.bar(
-                dates, cnts,
-                color="#34D399", alpha=0.75, edgecolor="#064E3B", linewidth=0.5,
-                width=0.8,
-            )
-            # Add gradient-like colour intensity by height
-            max_c = max(cnts) if len(cnts) else 1
-            for bar, c in zip(bars, cnts):
-                alpha = 0.4 + 0.6 * (c / max_c)
-                bar.set_alpha(alpha)
-
-            timeline_ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-            timeline_ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-            plt.setp(timeline_ax.xaxis.get_majorticklabels(),
-                     rotation=35, ha="right", fontsize=7, color="#9CA3AF")
+            # Format x-axis labels
+            labels = [item.get_text() for item in timeline_ax.get_xticklabels()]
+            # Convert string dates like '2023-10-01' to 'Oct 01'
+            formatted_labels = []
+            for lab in labels:
+                try:
+                    formatted_labels.append(pd.to_datetime(lab).strftime("%b %d"))
+                except:
+                    formatted_labels.append(lab)
+            
+            timeline_ax.set_xticklabels(formatted_labels, rotation=35, ha="right", fontsize=7, color="#9CA3AF")
         else:
             timeline_ax.text(
                 0.5, 0.5, "No timestamp data",
