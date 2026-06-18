@@ -1,27 +1,33 @@
 /**
- * UNIBEN Biodiversity Pipeline — Premium React Dashboard v3
+ * UNIBEN Biodiversity Pipeline — Premium React Dashboard v4
  *
- * Tab 1 — Live Telemetry  : Provenance toggle, metric cards, spark-lines, readings table
- * Tab 2 — Manual Override  : 5-param form + timestamp, ENGAGE PIPELINE ENGINE button
- * Tab 3 — Field Media      : Dual drag-and-drop (Drone Overhead + Ground Taxonomic)
+ * Tab 1 — Live Telemetry   : 6-param metric cards + sparklines + provenance toggle
+ * Tab 2 — Field Sync Hub   : ENGAGE PIPELINE ENGINE + Excel download
+ * Tab 3 — Field Media      : Aerial Context Frame + Batch Ground + SD Card Contingency
  *
- * Five mandatory environmental parameters:
- *   Temperature (°C) · Humidity (%) · Pressure (hPa) · Light (Lux) · Sound (dB)
+ * Six parameters streamed from ESP32 + browser geolocation:
+ *   Temperature (°C) · Humidity (%) · Pressure (hPa) · Light (Lux) · Sound (dB) · Altitude (m)
+ *
+ * Domain 2: Manual Override tab completely removed.
+ * Domain 3: navigator.geolocation auto-captured; WebSocket /ws/telemetry client integrated.
+ * Domain 4: SD Card Contingency drop zone added to Field Media tab.
  */
 
 import { useState, useEffect, useCallback, useRef, memo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Thermometer, Droplets, Gauge, Sun, Volume2,
+  Thermometer, Droplets, Gauge, Sun, Volume2, Mountain,
   Activity, RefreshCw, CheckCircle2, XCircle,
   Wifi, WifiOff, Cpu, Database, UploadCloud,
   BarChart2, Zap, Filter, ChevronRight, Download,
   Camera, ImagePlus, FlaskConical, Layers,
+  HardDrive, MapPin, AlertTriangle,
 } from 'lucide-react';
 import { ResponsiveContainer, LineChart, Line, Tooltip } from 'recharts';
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 const API     = 'http://127.0.0.1:8000';
+const WS_URL  = 'ws://127.0.0.1:8000/ws/telemetry';
 const POLL_MS = 2500;
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -51,7 +57,7 @@ function SparkTip({ active, payload }) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Metric definitions                                                         */
+/*  Metric definitions — 6 parameters                                          */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 const METRICS = [
@@ -60,6 +66,7 @@ const METRICS = [
   { key: 'pressure_hPa',     label: 'Pressure',    unit: ' hPa',Icon: Gauge,       color: '#a78bfa' },
   { key: 'light_lux',        label: 'Light',       unit: ' Lux',Icon: Sun,         color: '#fbbf24' },
   { key: 'sound_db',         label: 'Sound',       unit: ' dB', Icon: Volume2,     color: '#34d399' },
+  { key: 'altitude_m',       label: 'Altitude',    unit: ' m',  Icon: Mountain,    color: '#2dd4bf' },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -107,9 +114,9 @@ const MetricCard = memo(function MetricCard({ metric, value, history }) {
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 const PROVENANCE_MODES = [
-  { id: 'ALL',      label: 'Blended Timeline',    icon: Layers },
-  { id: 'LIVE_ESP32',  label: 'Live ESP32 Only',  icon: Wifi },
-  { id: 'MANUAL_OVERRIDE', label: 'Manual Overrides Only', icon: FlaskConical },
+  { id: 'ALL',           label: 'All Sources',     icon: Layers },
+  { id: 'LIVE_ESP32',    label: 'Live ESP32',       icon: Wifi },
+  { id: 'ESP32_SD_CARD', label: 'SD Card Import',   icon: HardDrive },
 ];
 
 function ProvenanceToggle({ mode, onChange }) {
@@ -142,10 +149,28 @@ function ProvenanceToggle({ mode, onChange }) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
+/*  Source badge helper                                                        */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+function SourceBadge({ source }) {
+  const s = source || 'LIVE_ESP32';
+  const cfg = {
+    LIVE_ESP32:    { cls: 'bg-emerald-900/30 text-emerald-400',  label: 'ESP32' },
+    ESP32_SD_CARD: { cls: 'bg-sky-900/30 text-sky-400',          label: 'SD CARD' },
+    MANUAL_OVERRIDE: { cls: 'bg-orange-900/30 text-orange-400',  label: 'MANUAL' },
+  }[s] ?? { cls: 'bg-gray-800 text-gray-400', label: s };
+  return (
+    <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${cfg.cls}`}>
+      {cfg.label}
+    </span>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
 /*  Tab 1 — Live Telemetry Dashboard                                           */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
-function TelemetryTab({ readings, histories }) {
+function TelemetryTab({ readings, histories, geoCoords, wsState }) {
   const [provenance, setProvenance] = useState('ALL');
 
   const filtered = provenance === 'ALL'
@@ -156,11 +181,31 @@ function TelemetryTab({ readings, histories }) {
 
   return (
     <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-3">
+      {/* Geolocation + WebSocket status bar */}
+      <motion.div variants={panelV} className="glass p-3 flex flex-wrap items-center gap-3">
+        <MapPin size={11} className="text-emerald-500 shrink-0" />
+        <span className="font-jakarta text-[9px] text-gray-500 uppercase tracking-widest">Browser GPS</span>
+        {geoCoords ? (
+          <span className="font-grotesk text-[10px] text-emerald-300">
+            {geoCoords.latitude.toFixed(5)}, {geoCoords.longitude.toFixed(5)}
+            {geoCoords.altitude != null && ` · ${geoCoords.altitude.toFixed(1)} m`}
+          </span>
+        ) : (
+          <span className="font-grotesk text-[10px] text-gray-600">Acquiring GPS…</span>
+        )}
+        <span className="ml-auto flex items-center gap-1.5">
+          <span className={`w-2 h-2 rounded-full ${wsState === 'open' ? 'bg-emerald-400 animate-pulse' : 'bg-red-500'}`} />
+          <span className={`font-jakarta text-[9px] ${wsState === 'open' ? 'text-emerald-400' : 'text-red-400'}`}>
+            {wsState === 'open' ? 'WS Live' : 'WS Offline'}
+          </span>
+        </span>
+      </motion.div>
+
       {/* Provenance toggle */}
       <ProvenanceToggle mode={provenance} onChange={setProvenance} />
 
-      {/* Metric tiles */}
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
+      {/* 6-Param Metric tiles */}
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
         {METRICS.map(m => (
           <MetricCard
             key={m.key}
@@ -185,7 +230,7 @@ function TelemetryTab({ readings, histories }) {
           <table className="w-full text-[10px] font-grotesk border-collapse">
             <thead>
               <tr className="text-gray-600 border-b border-emerald-900/20">
-                {['Timestamp','Source','Temp','Humidity','Pressure','Light','Sound','Device'].map(h => (
+                {['Timestamp','Source','Temp','Humidity','Pressure','Light','Sound','Altitude','Device'].map(h => (
                   <th key={h} className="text-left py-1.5 pr-4 font-medium">{h}</th>
                 ))}
               </tr>
@@ -194,19 +239,13 @@ function TelemetryTab({ readings, histories }) {
               {filtered.slice(0, 40).map(r => (
                 <tr key={r.id} className="border-b border-emerald-900/10 hover:bg-emerald-900/10 transition-colors">
                   <td className="py-1.5 pr-4 text-gray-500">{new Date(r.observed_at).toLocaleString()}</td>
-                  <td className="py-1.5 pr-4">
-                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium
-                      ${(r.data_source || 'LIVE_ESP32') === 'LIVE_ESP32'
-                        ? 'bg-emerald-900/30 text-emerald-400'
-                        : 'bg-orange-900/30 text-orange-400'}`}>
-                      {(r.data_source || 'LIVE_ESP32') === 'LIVE_ESP32' ? 'ESP32' : 'MANUAL'}
-                    </span>
-                  </td>
+                  <td className="py-1.5 pr-4"><SourceBadge source={r.data_source} /></td>
                   <td className="py-1.5 pr-4 text-orange-300">{r.temperature_c?.toFixed(1)}°</td>
                   <td className="py-1.5 pr-4 text-sky-300">{r.humidity_percent?.toFixed(1)}%</td>
                   <td className="py-1.5 pr-4 text-violet-300">{r.pressure_hPa?.toFixed(1)}</td>
                   <td className="py-1.5 pr-4 text-yellow-300">{r.light_lux?.toFixed(0)}</td>
                   <td className="py-1.5 pr-4 text-emerald-300">{r.sound_db?.toFixed(1)}</td>
+                  <td className="py-1.5 pr-4 text-teal-300">{r.altitude_m != null ? `${r.altitude_m.toFixed(1)} m` : '—'}</td>
                   <td className="py-1.5 pr-4 text-gray-600 truncate max-w-[80px]">{r.device_id}</td>
                 </tr>
               ))}
@@ -244,7 +283,7 @@ function useCacheBust(ms = 300_000) {
 }
 
 const ANALYTICS_PLOTS = [
-  { src: '/analytics/sensor_correlations.png',  title: '5-Parameter Sensor Correlation Matrix',
+  { src: '/analytics/sensor_correlations.png',  title: '6-Parameter Sensor Correlation Matrix',
     desc: 'Pearson coefficients · auto-refresh 5 min' },
   { src: '/analytics/biodiversity_density.png', title: 'Biodiversity Encounter Density',
     desc: 'KDE distribution + observation frequency' },
@@ -312,148 +351,51 @@ function AnalyticsPanel() {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab 2 — Manual Override Form + ENGAGE ENGINE                               */
+/*  Tab 2 — Field Telemetry Sync Hub (replaces Manual Override)               */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
-const OVERRIDE_DEFAULTS = {
-  device_id:        'MANUAL-OVERRIDE-001',
-  temperature_c:    '27.0',
-  humidity_percent: '72.0',
-  pressure_hPa:     '1013.25',
-  light_lux:        '850.0',
-  sound_db:         '42.0',
-  latitude:         '6.335000',
-  longitude:        '5.603700',
-  observed_at:      '',
-  notes:            '',
-};
-
-function OverrideField({ label, name, value, onChange, type = 'number', step = 'any', placeholder = '' }) {
-  return (
-    <div className="flex flex-col gap-1">
-      <label className="text-[9px] font-jakarta text-gray-500 uppercase tracking-wider">{label}</label>
-      <input
-        type={type} name={name} value={value} onChange={onChange}
-        step={step} autoComplete="off" placeholder={placeholder}
-        className="bg-white/5 border border-emerald-900/30 rounded-lg px-3 py-2
-          text-[11px] font-grotesk text-gray-200 placeholder-gray-700
-          focus:outline-none focus:border-emerald-500/60 focus:ring-1 focus:ring-emerald-500/30
-          transition-all duration-200"
-      />
-    </div>
-  );
-}
-
-function ManualOverrideTab({ onEngaged }) {
-  const [form,    setForm]    = useState(OVERRIDE_DEFAULTS);
-  const [running, setRunning] = useState(false);
-  const [result,  setResult]  = useState(null);
-  const [error,   setError]   = useState('');
-
-  const handleChange = useCallback(e => {
-    setForm(f => ({ ...f, [e.target.name]: e.target.value }));
-  }, []);
+function SDSyncTab({ onPipelineComplete }) {
+  const [running,   setRunning]   = useState(false);
+  const [result,    setResult]    = useState(null);
+  const [error,     setError]     = useState('');
 
   const engage = useCallback(async () => {
     setRunning(true);
     setError('');
     setResult(null);
     try {
-      const body = {
-        device_id:        form.device_id,
-        temperature_c:    parseFloat(form.temperature_c)    || null,
-        humidity_percent: parseFloat(form.humidity_percent) || null,
-        pressure_hPa:     parseFloat(form.pressure_hPa)    || null,
-        light_lux:        parseFloat(form.light_lux)        || null,
-        sound_db:         parseFloat(form.sound_db)         || null,
-        latitude:         parseFloat(form.latitude)         || null,
-        longitude:        parseFloat(form.longitude)        || null,
-        observed_at:      form.observed_at || null,
-        notes:            form.notes || null,
-        sync_session_id:  null,
-      };
-      const res  = await fetch(`${API}/api/v1/engage-pipeline`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      const res  = await fetch(`${API}/api/v1/analytics/run-pipeline`, { method: 'POST' });
       if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
       const data = await res.json();
       setResult(data);
-      onEngaged?.();
+      onPipelineComplete?.();
     } catch (err) {
       setError(err.message);
     } finally {
       setRunning(false);
     }
-  }, [form, onEngaged]);
+  }, [onPipelineComplete]);
 
   return (
     <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-4">
 
-      {/* Manual parameter form */}
-      <motion.div variants={panelV} className="glass p-5 space-y-4">
-        <div className="flex items-center gap-2 mb-1">
-          <FlaskConical size={13} className="text-emerald-400" />
+      {/* Header banner */}
+      <motion.div variants={panelV} className="glass p-4 flex items-center gap-3">
+        <Database size={16} className="text-emerald-400 shrink-0" />
+        <div>
           <p className="font-jakarta text-[11px] font-semibold text-emerald-300">
-            Manual Parameter Override Entry
+            Field Telemetry Sync Hub
           </p>
-          <span className="ml-auto font-grotesk text-[9px] text-orange-400 bg-orange-900/20
-            border border-orange-700/30 px-2 py-0.5 rounded-full">
-            MANUAL_OVERRIDE
-          </span>
-        </div>
-
-        {/* Device + Timestamp */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <OverrideField label="Device ID" name="device_id" value={form.device_id}
-            onChange={handleChange} type="text" placeholder="ESP32-UNIT-001" />
-          <OverrideField label="Observation Timestamp (leave blank = now)"
-            name="observed_at" value={form.observed_at}
-            onChange={handleChange} type="datetime-local" />
-        </div>
-
-        {/* 5-parameter sensor inputs */}
-        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
-          <OverrideField label="Temperature (°C)"  name="temperature_c"
-            value={form.temperature_c}    onChange={handleChange} step="0.01" />
-          <OverrideField label="Humidity (%)"       name="humidity_percent"
-            value={form.humidity_percent} onChange={handleChange} step="0.01" />
-          <OverrideField label="Pressure (hPa)"     name="pressure_hPa"
-            value={form.pressure_hPa}    onChange={handleChange} step="0.01" />
-          <OverrideField label="Light (Lux)"        name="light_lux"
-            value={form.light_lux}        onChange={handleChange} step="1" />
-          <OverrideField label="Sound (dB)"         name="sound_db"
-            value={form.sound_db}         onChange={handleChange} step="0.1" />
-        </div>
-
-        {/* GPS */}
-        <div className="grid grid-cols-2 gap-3">
-          <OverrideField label="Latitude"  name="latitude"  value={form.latitude}
-            onChange={handleChange} step="0.000001" />
-          <OverrideField label="Longitude" name="longitude" value={form.longitude}
-            onChange={handleChange} step="0.000001" />
-        </div>
-
-        {/* Notes */}
-        <div className="flex flex-col gap-1">
-          <label className="text-[9px] font-jakarta text-gray-500 uppercase tracking-wider">
-            Field Notes
-          </label>
-          <textarea
-            name="notes" value={form.notes} onChange={handleChange}
-            rows={2} placeholder="Optional field notes..."
-            className="bg-white/5 border border-emerald-900/30 rounded-lg px-3 py-2
-              text-[11px] font-grotesk text-gray-200 placeholder-gray-700 resize-none
-              focus:outline-none focus:border-emerald-500/60 focus:ring-1 focus:ring-emerald-500/30
-              transition-all duration-200"
-          />
+          <p className="font-grotesk text-[9px] text-gray-600 mt-0.5">
+            Trigger the data science analytics engine · generate 4-sheet styled Excel · export dataset
+          </p>
         </div>
       </motion.div>
 
       {/* ENGAGE ENGINE button */}
       <motion.div variants={panelV}>
         <motion.button
+          id="engage-pipeline-btn"
           onClick={engage}
           disabled={running}
           whileHover={{ scale: running ? 1 : 1.015, boxShadow: '0 0 40px rgba(52,211,153,0.35)' }}
@@ -480,8 +422,7 @@ function ManualOverrideTab({ onEngaged }) {
       <AnimatePresence>
         {error && (
           <motion.div
-            initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
+            initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
             className="glass border border-red-700/40 p-3 rounded-xl flex items-start gap-2"
           >
             <XCircle size={13} className="text-red-400 mt-0.5 shrink-0" />
@@ -503,8 +444,14 @@ function ManualOverrideTab({ onEngaged }) {
             >
               <CheckCircle2 size={13} className="text-emerald-400 shrink-0" />
               <p className="font-jakarta text-[10px] text-emerald-300 font-semibold">
-                Pipeline cycle complete · session <code className="text-gray-400">{result.session_id?.slice(0,16)}…</code>
+                Pipeline complete · session <code className="text-gray-400">{result.session_id?.slice(0, 16)}…</code>
               </p>
+              {result.anomaly_count > 0 && (
+                <span className="flex items-center gap-1 ml-2 px-2 py-0.5 rounded-full bg-amber-900/30 border border-amber-600/30 text-amber-300 text-[9px] font-jakarta">
+                  <AlertTriangle size={9} />
+                  {result.anomaly_count} anomaly{result.anomaly_count !== 1 ? 's' : ''}
+                </span>
+              )}
               {result.excel_download_url && (
                 <a
                   href={`${API}${result.excel_download_url}`}
@@ -512,7 +459,7 @@ function ManualOverrideTab({ onEngaged }) {
                   className="ml-auto flex items-center gap-1 font-jakarta text-[9px] text-emerald-400
                     border border-emerald-600/30 px-2 py-1 rounded-lg hover:bg-emerald-900/20 transition-colors"
                 >
-                  <Download size={10} /> Download Excel
+                  <Download size={10} /> Download 4-Sheet Excel
                 </a>
               )}
             </motion.div>
@@ -532,6 +479,24 @@ function ManualOverrideTab({ onEngaged }) {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Excel Download Gateway */}
+      <motion.div variants={panelV} className="glass p-4 rounded-xl border border-emerald-900/30">
+        <p className="font-jakarta text-[9px] text-gray-500 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+          <Download size={10} className="text-emerald-500" />
+          .XLSX DB Snapshot Gateway
+        </p>
+        <a
+          href={`${API}/api/v1/reports/export-excel?session_id=all`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center justify-center gap-2 w-full py-2.5 rounded-xl font-jakarta text-[10px] font-bold
+            border border-emerald-700/40 text-emerald-300 hover:bg-emerald-900/20 transition-colors"
+        >
+          <Download size={12} />
+          Download Full 4-Sheet Excel Workbook
+        </a>
+      </motion.div>
 
     </motion.div>
   );
@@ -566,7 +531,6 @@ function ImageDropZone({ label, subtitle, icon: Icon, file, preview, onFile, acc
 
   return (
     <motion.div variants={panelV} className="glass p-4 flex flex-col gap-3">
-      {/* Header */}
       <div className="flex items-center gap-2">
         <Icon size={13} style={{ color: accentColor }} />
         <div>
@@ -576,8 +540,6 @@ function ImageDropZone({ label, subtitle, icon: Icon, file, preview, onFile, acc
           <p className="font-grotesk text-[9px] text-gray-600">{subtitle}</p>
         </div>
       </div>
-
-      {/* Drop zone */}
       <div
         ref={dd.ref}
         onDragOver={dd.onDragOver}
@@ -588,47 +550,206 @@ function ImageDropZone({ label, subtitle, icon: Icon, file, preview, onFile, acc
           flex flex-col items-center justify-center gap-2 p-6
           transition-all duration-300"
         style={{
-          borderColor: dd.dragging
-            ? accentColor
-            : `${accentColor}44`,
-          background: dd.dragging
-            ? `${accentColor}11`
-            : 'transparent',
-          minHeight: preview ? 'auto' : 140,
+          borderColor: dd.dragging ? accentColor : `${accentColor}44`,
+          background:  dd.dragging ? `${accentColor}11` : 'transparent',
+          minHeight:   preview ? 'auto' : 140,
         }}
       >
-        <input
-          type="file"
-          accept="image/*"
-          className="hidden"
-          onChange={dd.onInput}
-        />
+        <input type="file" accept="image/*" className="hidden" onChange={dd.onInput} />
         {preview ? (
           <div className="w-full">
-            <img
-              src={preview}
-              alt={label}
-              className="w-full rounded-lg object-contain max-h-52"
-            />
-            <p className="font-grotesk text-[9px] text-gray-600 text-center mt-2 truncate">
-              {file?.name}
-            </p>
+            <img src={preview} alt={label} className="w-full rounded-lg object-contain max-h-52" />
+            <p className="font-grotesk text-[9px] text-gray-600 text-center mt-2 truncate">{file?.name}</p>
           </div>
         ) : (
           <>
             <UploadCloud size={26} style={{ color: accentColor, opacity: 0.5 }} />
-            <p className="font-jakarta text-[10px] text-gray-600 text-center">
-              Drag &amp; drop or click to select
-            </p>
-            <p className="font-grotesk text-[9px] text-gray-700 text-center">
-              JPG · PNG · TIFF · WebP
-            </p>
+            <p className="font-jakarta text-[10px] text-gray-600 text-center">Drag &amp; drop or click to select</p>
+            <p className="font-grotesk text-[9px] text-gray-700 text-center">JPG · PNG · TIFF · WebP</p>
           </>
         )}
       </div>
     </motion.div>
   );
 }
+
+/* ── SD Card Contingency Upload Zone ─────────────────────────────────────── */
+
+function SDCardDropZone() {
+  const [sdFile,    setSDFile]    = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [result,    setResult]    = useState(null);
+  const [error,     setError]     = useState('');
+  const [dragging,  setDragging]  = useState(false);
+  const inputRef = useRef(null);
+
+  const handleFile = useCallback(file => {
+    setSDFile(file);
+    setResult(null);
+    setError('');
+  }, []);
+
+  const onDragOver  = e => { e.preventDefault(); setDragging(true); };
+  const onDragLeave = () => setDragging(false);
+  const onDrop      = useCallback(e => {
+    e.preventDefault();
+    setDragging(false);
+    const f = e.dataTransfer?.files?.[0];
+    if (f) handleFile(f);
+  }, [handleFile]);
+
+  const upload = useCallback(async () => {
+    if (!sdFile) return;
+    setUploading(true);
+    setError('');
+    setResult(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', sdFile);
+      const res = await fetch(`${API}/api/telemetry/upload-contingency`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
+      setResult(await res.json());
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setUploading(false);
+    }
+  }, [sdFile]);
+
+  return (
+    <motion.div variants={panelV} className="glass p-4 flex flex-col gap-3"
+      style={{ border: '1px solid rgba(245,158,11,0.25)' }}>
+      {/* Header */}
+      <div className="flex items-center gap-2">
+        <HardDrive size={13} className="text-amber-400" />
+        <div>
+          <p className="font-jakarta text-[11px] font-semibold text-amber-400">
+            🗃️ SD Card Contingency Upload
+          </p>
+          <p className="font-grotesk text-[9px] text-gray-600">
+            Ingest raw ESP32 SD card CSV/TXT log · idempotent — duplicates silently skipped
+          </p>
+        </div>
+        <span className="ml-auto font-grotesk text-[9px] text-amber-400 bg-amber-900/20
+          border border-amber-700/30 px-2 py-0.5 rounded-full">
+          ESP32_SD_CARD
+        </span>
+      </div>
+
+      {/* Drop zone */}
+      <div
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+        onClick={() => inputRef.current?.click()}
+        className="rounded-xl border-2 border-dashed cursor-pointer
+          flex flex-col items-center justify-center gap-2 p-6 transition-all duration-300"
+        style={{
+          borderColor: dragging ? '#f59e0b' : 'rgba(245,158,11,0.3)',
+          background:  dragging ? 'rgba(245,158,11,0.08)' : 'transparent',
+          minHeight:   120,
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".csv,.txt"
+          className="hidden"
+          onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); }}
+        />
+        {sdFile ? (
+          <div className="text-center">
+            <HardDrive size={22} className="text-amber-400 mx-auto mb-1" />
+            <p className="font-grotesk text-[10px] text-amber-300 font-semibold">{sdFile.name}</p>
+            <p className="font-grotesk text-[9px] text-gray-600 mt-0.5">
+              {(sdFile.size / 1024).toFixed(1)} KB
+            </p>
+          </div>
+        ) : (
+          <>
+            <HardDrive size={26} className="text-amber-500 opacity-50" />
+            <p className="font-jakarta text-[10px] text-gray-600 text-center">Drop ESP32 log file here</p>
+            <p className="font-grotesk text-[9px] text-gray-700 text-center">.CSV · .TXT</p>
+          </>
+        )}
+      </div>
+
+      {/* Upload button */}
+      {sdFile && (
+        <motion.button
+          initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
+          onClick={upload}
+          disabled={uploading}
+          className="w-full py-2.5 rounded-xl font-jakarta font-bold text-[11px] tracking-wide
+            flex items-center justify-center gap-2 disabled:opacity-50 transition-all"
+          style={{
+            background: uploading
+              ? 'linear-gradient(135deg, #78350f, #92400e)'
+              : 'linear-gradient(135deg, #d97706, #b45309, #92400e)',
+            boxShadow: uploading ? 'none' : '0 0 20px rgba(217,119,6,0.25)',
+          }}
+        >
+          {uploading
+            ? <><RefreshCw size={13} className="animate-spin" />Parsing SD Log…</>
+            : <><UploadCloud size={13} />Ingest SD Card Log</>
+          }
+        </motion.button>
+      )}
+
+      {/* Error */}
+      <AnimatePresence>
+        {error && (
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="glass border border-red-700/40 p-2 rounded-xl flex items-center gap-2">
+            <XCircle size={11} className="text-red-400 shrink-0" />
+            <p className="font-grotesk text-[10px] text-red-300">{error}</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Result card */}
+      <AnimatePresence>
+        {result && (
+          <motion.div
+            variants={panelV} initial="hidden" animate="visible" exit={{ opacity: 0 }}
+            className="glass border border-amber-700/30 p-3 rounded-xl space-y-2"
+          >
+            <div className="flex items-center gap-2">
+              <CheckCircle2 size={12} className="text-amber-400" />
+              <p className="font-jakarta text-[10px] font-semibold text-amber-300">SD Card Import Complete</p>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { label: 'Parsed',   value: result.rows_parsed,   color: 'text-gray-300' },
+                { label: 'Inserted', value: result.rows_inserted, color: 'text-emerald-300' },
+                { label: 'Skipped',  value: result.rows_skipped,  color: 'text-amber-300' },
+              ].map(({ label, value, color }) => (
+                <div key={label} className="glass p-2 rounded-lg text-center">
+                  <p className={`font-grotesk text-base font-bold ${color}`}>{value}</p>
+                  <p className="font-jakarta text-[8px] text-gray-600 uppercase tracking-widest">{label}</p>
+                </div>
+              ))}
+            </div>
+            {result.errors?.length > 0 && (
+              <details className="mt-1">
+                <summary className="font-jakarta text-[9px] text-amber-600 cursor-pointer">
+                  {result.errors.length} row warning{result.errors.length !== 1 ? 's' : ''}
+                </summary>
+                <div className="mt-1 space-y-0.5 max-h-28 overflow-y-auto">
+                  {result.errors.map((e, i) => (
+                    <p key={i} className="font-grotesk text-[8px] text-gray-600">{e}</p>
+                  ))}
+                </div>
+              </details>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
+  );
+}
+
+/* ── Field Media Tab ─────────────────────────────────────────────────────── */
 
 function FieldMediaTab({ onSessionCreated }) {
   const [droneFile,    setDroneFile]    = useState(null);
@@ -656,7 +777,7 @@ function FieldMediaTab({ onSessionCreated }) {
 
   const submit = useCallback(async () => {
     if (!droneFile && groundFiles.length === 0) {
-      setError('Drop at least one drone image or ground images before submitting.');
+      setError('Drop at least one aerial frame or ground images before submitting.');
       return;
     }
     setUploading(true);
@@ -668,25 +789,23 @@ function FieldMediaTab({ onSessionCreated }) {
         const droneFd = new FormData();
         droneFd.append('drone_file', droneFile);
         droneFd.append('campus_zone', campusZone);
-        
         const droneRes = await fetch(`${API}/api/v1/upload-drone-patch`, { method: 'POST', body: droneFd });
         if (!droneRes.ok) throw new Error(`Drone upload HTTP ${droneRes.status}`);
         const droneData = await droneRes.json();
         droneId = droneData.drone_id;
       }
-      
+
       let groundData = null;
       if (groundFiles.length > 0) {
         const groundFd = new FormData();
         if (droneId) groundFd.append('drone_id', droneId);
         groundFd.append('observer_id', 'System');
         groundFiles.forEach(f => groundFd.append('ground_files', f));
-        
         const groundRes = await fetch(`${API}/api/v1/upload-ground-batch`, { method: 'POST', body: groundFd });
         if (!groundRes.ok) throw new Error(`Ground upload HTTP ${groundRes.status}`);
         groundData = await groundRes.json();
       }
-      
+
       setResult({ droneId, groundResults: groundData?.results });
       onSessionCreated?.();
     } catch (err) {
@@ -710,8 +829,9 @@ function FieldMediaTab({ onSessionCreated }) {
         </span>
       </motion.div>
 
+      {/* ── Aerial Frame + Ground Batch (UNTOUCHED) ── */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left Column: Drone Image & Zone Dropdown (1/3 width) */}
+        {/* Left: Drone Image & Zone */}
         <div className="lg:col-span-1 space-y-4">
           <ImageDropZone
             label="Aerial Context Frame"
@@ -724,32 +844,32 @@ function FieldMediaTab({ onSessionCreated }) {
           />
           <motion.div variants={panelV} className="glass p-4 space-y-2">
             <label className="font-jakarta text-[9px] text-gray-500 uppercase tracking-wider">Campus Zone</label>
-            <select 
+            <select
               value={campusZone} onChange={e => setCampusZone(e.target.value)}
               className="w-full bg-white/5 border border-emerald-900/30 rounded-lg px-3 py-2 text-[11px] font-grotesk focus:outline-none"
             >
               {[...Array(10)].map((_, i) => (
-                <option key={i} value={`Zone ${i+1}`} className="bg-[#0B0F19]">Zone {i+1}</option>
+                <option key={i} value={`Zone ${i + 1}`} className="bg-[#0B0F19]">Zone {i + 1}</option>
               ))}
             </select>
           </motion.div>
         </div>
 
-        {/* Right Column: Ground Batch Uploader (2/3 width) */}
+        {/* Right: Ground Batch */}
         <div className="lg:col-span-2">
           <motion.div variants={panelV} className="glass p-4 h-full flex flex-col gap-3">
             <div className="flex items-center gap-2">
               <FlaskConical size={13} className="text-orange-400" />
               <div>
                 <p className="font-jakarta text-[11px] font-semibold text-orange-400">Batch Ground Taxon Capture</p>
-                <p className="font-grotesk text-[9px] text-gray-600">Upload multiple ground images</p>
+                <p className="font-grotesk text-[9px] text-gray-600">Upload multiple ground images · PlantNet taxonomy runs in background</p>
               </div>
             </div>
-            
+
             <div
               onDragOver={e => e.preventDefault()}
               onDrop={handleGroundDrop}
-              className="flex-1 rounded-xl border-2 border-dashed border-orange-500/40 bg-orange-500/5 
+              className="flex-1 rounded-xl border-2 border-dashed border-orange-500/40 bg-orange-500/5
                 flex flex-col items-center justify-center gap-2 p-6 cursor-pointer hover:bg-orange-500/10 transition-colors"
               onClick={() => document.getElementById('batch-upload').click()}
             >
@@ -757,13 +877,14 @@ function FieldMediaTab({ onSessionCreated }) {
               <UploadCloud size={26} className="text-orange-400 opacity-50" />
               <p className="font-jakarta text-[10px] text-gray-600">Drop multiple images here</p>
             </div>
-            
+
             {groundFiles.length > 0 && (
               <div className="grid grid-cols-4 gap-2 mt-2">
                 {groundFiles.map((f, i) => (
                   <div key={i} className="relative aspect-square rounded-lg border border-emerald-900/30 overflow-hidden group">
                     <img src={URL.createObjectURL(f)} className="w-full h-full object-cover" />
-                    <button onClick={() => removeGroundFile(i)} className="absolute top-1 right-1 bg-red-500/80 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100">
+                    <button onClick={() => removeGroundFile(i)}
+                      className="absolute top-1 right-1 bg-red-500/80 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100">
                       <XCircle size={10} />
                     </button>
                   </div>
@@ -774,22 +895,25 @@ function FieldMediaTab({ onSessionCreated }) {
         </div>
       </div>
 
+      {/* Submit / Clear buttons */}
       <motion.div variants={panelV} className="flex gap-3">
         <motion.button
           onClick={submit} disabled={uploading || (!droneFile && groundFiles.length === 0)}
           className="flex-1 py-3 rounded-xl font-jakarta font-bold text-sm tracking-wide flex items-center justify-center gap-2 disabled:opacity-40"
           style={{ background: 'linear-gradient(135deg, #10B981, #047857)', boxShadow: '0 0 20px rgba(16,185,129,0.2)' }}
         >
-          {uploading ? <><RefreshCw size={14} className="animate-spin" /> Processing Batch...</> : <><UploadCloud size={14} /> Submit Dual-View Data</>}
+          {uploading ? <><RefreshCw size={14} className="animate-spin" />Processing Batch…</> : <><UploadCloud size={14} />Submit Dual-View Data</>}
         </motion.button>
         {(droneFile || groundFiles.length > 0 || result) && (
           <button onClick={reset} className="px-4 py-3 rounded-xl glass border border-emerald-900/30 font-jakarta text-[10px] text-gray-500 hover:text-gray-300">Clear</button>
         )}
       </motion.div>
 
+      {/* Image upload result */}
       <AnimatePresence>
         {error && (
-          <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="glass border border-red-700/40 p-3 rounded-xl flex items-start gap-2">
+          <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+            className="glass border border-red-700/40 p-3 rounded-xl flex items-start gap-2">
             <XCircle size={12} className="text-red-400 mt-0.5" />
             <p className="font-grotesk text-[10px] text-red-300">{error}</p>
           </motion.div>
@@ -808,7 +932,7 @@ function FieldMediaTab({ onSessionCreated }) {
                     <p className="font-grotesk text-[10px] text-gray-400">{r.file}</p>
                     {r.status === 'success' ? (
                       <p className="font-jakarta text-[10px] text-emerald-400">
-                        {r.inference?.predicted_label || 'Unclassified'} ({(r.inference?.confidence * 100).toFixed(1)}%)
+                        {r.inference?.predicted_label || 'Unclassified'} ({((r.inference?.confidence || 0) * 100).toFixed(1)}%)
                       </p>
                     ) : (
                       <p className="font-jakarta text-[10px] text-red-400">Error</p>
@@ -820,31 +944,37 @@ function FieldMediaTab({ onSessionCreated }) {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* ── SD Card Contingency Upload (visually distinct) ── */}
+      <div className="pt-2">
+        <SDCardDropZone />
+      </div>
     </motion.div>
   );
 }
 
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Report Footer — email dispatch                                             */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
 function ReportFooter() {
-  const [email, setEmail] = useState('');
-  const [includeExcel, setIncludeExcel] = useState(true);
-  const [includePdf, setIncludePdf] = useState(true);
+  const [email,   setEmail]   = useState('');
   const [sending, setSending] = useState(false);
-  const [status, setStatus] = useState('');
+  const [msgStatus, setMsgStatus] = useState('');
 
   const sendEmail = async () => {
     if (!email) return;
     setSending(true);
-    setStatus('');
+    setMsgStatus('');
     try {
       const res = await fetch(`${API}/api/v1/reports/share-email`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, include_excel: includeExcel, include_pdf: includePdf })
+        body: JSON.stringify({ email, attach_excel: true, attach_pdf: false }),
       });
-      if (res.ok) setStatus('Email queued for delivery.');
-      else setStatus('Failed to send.');
+      setMsgStatus(res.ok ? 'Email queued for delivery.' : 'Failed to send.');
     } catch {
-      setStatus('Network error.');
+      setMsgStatus('Network error.');
     } finally {
       setSending(false);
     }
@@ -854,33 +984,27 @@ function ReportFooter() {
     <motion.div variants={panelV} className="mt-6 p-4 rounded-2xl glass border border-emerald-900/40">
       <div className="flex flex-col md:flex-row items-center gap-4 justify-between">
         <div>
-          <h3 className="font-jakarta text-xs font-bold text-emerald-400 flex items-center gap-2"><Download size={14} /> Academic Research Reporting &amp; Data Export Gateway</h3>
+          <h3 className="font-jakarta text-xs font-bold text-emerald-400 flex items-center gap-2">
+            <Download size={14} /> Academic Research Reporting &amp; Data Export Gateway
+          </h3>
           <p className="text-[10px] text-gray-500 mt-1">Export linked spatial, taxonomical, and telemetry data.</p>
         </div>
-        <div className="flex flex-wrap items-center gap-3">
-          <label className="flex items-center gap-1.5 text-[10px] text-gray-400 font-jakarta cursor-pointer">
-            <input type="checkbox" checked={includeExcel} onChange={e => setIncludeExcel(e.target.checked)} className="rounded border-emerald-900/50 bg-[#0B0F19] text-emerald-500 focus:ring-0" />
-            .XLSX DB Snapshot
-          </label>
-          <label className="flex items-center gap-1.5 text-[10px] text-gray-400 font-jakarta cursor-pointer">
-            <input type="checkbox" checked={includePdf} onChange={e => setIncludePdf(e.target.checked)} className="rounded border-emerald-900/50 bg-[#0B0F19] text-emerald-500 focus:ring-0" />
-            .PDF Analysis
-          </label>
+        <div className="flex items-center gap-3">
           <div className="flex border border-emerald-800/40 rounded-lg overflow-hidden h-8">
-            <input 
+            <input
               type="email" placeholder="Researcher Email" value={email} onChange={e => setEmail(e.target.value)}
               className="bg-black/20 text-[10px] px-3 w-48 focus:outline-none text-emerald-100 placeholder-gray-600"
             />
-            <button 
+            <button
               onClick={sendEmail} disabled={sending || !email}
               className="bg-emerald-800/40 hover:bg-emerald-700/60 px-4 text-[10px] font-bold text-emerald-200 transition-colors disabled:opacity-50"
             >
-              {sending ? 'Sending...' : 'Send Mail'}
+              {sending ? 'Sending…' : 'Send Mail'}
             </button>
           </div>
         </div>
       </div>
-      {status && <p className="text-[10px] text-emerald-500 mt-2 text-right">{status}</p>}
+      {msgStatus && <p className="text-[10px] text-emerald-500 mt-2 text-right">{msgStatus}</p>}
     </motion.div>
   );
 }
@@ -892,25 +1016,20 @@ function ReportFooter() {
 function Pill({ ok, label }) {
   return (
     <div className="flex items-center gap-1.5">
-      {ok
-        ? <CheckCircle2 size={10} className="text-emerald-400" />
-        : <XCircle      size={10} className="text-red-500" />
-      }
-      <span className={`font-jakarta text-[10px] ${ok ? 'text-emerald-400' : 'text-red-500'}`}>
-        {label}
-      </span>
+      {ok ? <CheckCircle2 size={10} className="text-emerald-400" /> : <XCircle size={10} className="text-red-500" />}
+      <span className={`font-jakarta text-[10px] ${ok ? 'text-emerald-400' : 'text-red-500'}`}>{label}</span>
     </div>
   );
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab bar                                                                    */
+/*  Tab bar — 3 tabs (Manual Override removed)                                */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 const TABS = [
-  { id: 'telemetry', label: 'Live Telemetry',          icon: Activity },
-  { id: 'manual',    label: 'Manual Override & Engine', icon: FlaskConical },
-  { id: 'media',     label: 'Field Media & Mapping',    icon: Camera },
+  { id: 'telemetry', label: 'Live Telemetry',         icon: Activity },
+  { id: 'sync',      label: 'Field Sync Hub',          icon: Database },
+  { id: 'media',     label: 'Field Media & Mapping',   icon: Camera },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -923,8 +1042,62 @@ export default function App() {
   const [hardware,   setHardware]   = useState(null);
   const [readings,   setReadings]   = useState([]);
   const [histories,  setHistories]  = useState({});
+  const [geoCoords,  setGeoCoords]  = useState(null);
+  const [wsState,    setWsState]    = useState('closed');
+  const wsRef = useRef(null);
 
-  /* --- polling ----------------------------------------------------------- */
+  /* ── Browser geolocation — auto-acquired on mount ─────────────────────── */
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    const watchId = navigator.geolocation.watchPosition(
+      pos => {
+        setGeoCoords({
+          latitude:  pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          altitude:  pos.coords.altitude,
+          accuracy:  pos.coords.accuracy,
+        });
+      },
+      err => console.warn('Geolocation error:', err.message),
+      { enableHighAccuracy: true, maximumAge: 10000, timeout: 15000 },
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, []);
+
+  /* ── WebSocket client — /ws/telemetry ─────────────────────────────────── */
+  useEffect(() => {
+    let ws;
+    let reconnectTimer;
+
+    const connect = () => {
+      try {
+        ws = new WebSocket(WS_URL);
+        wsRef.current = ws;
+
+        ws.onopen  = () => setWsState('open');
+        ws.onclose = () => {
+          setWsState('closed');
+          reconnectTimer = setTimeout(connect, 5000);
+        };
+        ws.onerror = () => ws.close();
+        ws.onmessage = () => {
+          // ACK received — triggers a poll to refresh readings table
+          fetchReadings();
+        };
+      } catch {
+        reconnectTimer = setTimeout(connect, 5000);
+      }
+    };
+
+    connect();
+    return () => {
+      clearTimeout(reconnectTimer);
+      ws?.close();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ── Polling ──────────────────────────────────────────────────────────── */
   const fetchHealth = useCallback(async () => {
     try {
       const r = await fetch(`${API}/health`);
@@ -939,12 +1112,11 @@ export default function App() {
       if (!r.ok) return;
       const data = await r.json();
       setReadings(data);
-      // build sparkline histories (latest 20 per metric)
       setHistories(prev => {
         const next = { ...prev };
         METRICS.forEach(({ key }) => {
           const vals = data.slice(0, 20).map(row => row[key]).filter(v => v != null).reverse();
-          next[key]  = vals;
+          next[key] = vals;
         });
         return next;
       });
@@ -963,14 +1135,16 @@ export default function App() {
     fetchHealth();
     fetchHardware();
     fetchReadings();
-    const id = setInterval(() => { fetchHealth(); fetchHardware(); fetchReadings(); }, POLL_MS);
-    const hwId = setInterval(() => { fetchHardware(); }, 5000);
+    const id   = setInterval(() => { fetchHealth(); fetchHardware(); fetchReadings(); }, POLL_MS);
+    const hwId = setInterval(fetchHardware, 5000);
     return () => { clearInterval(id); clearInterval(hwId); };
   }, [fetchHealth, fetchHardware, fetchReadings]);
 
-  const refreshAll = useCallback(() => { fetchHealth(); fetchHardware(); fetchReadings(); }, [fetchHealth, fetchHardware, fetchReadings]);
+  const refreshAll = useCallback(() => {
+    fetchHealth(); fetchHardware(); fetchReadings();
+  }, [fetchHealth, fetchHardware, fetchReadings]);
 
-  /* --- render ------------------------------------------------------------ */
+  /* ── Render ────────────────────────────────────────────────────────────── */
   return (
     <div className="min-h-screen bg-[#0B0F19] text-gray-100 font-grotesk flex">
 
@@ -1012,8 +1186,8 @@ export default function App() {
           {hardware?.status === 'connected' ? (
             <div className="glass flex items-center gap-3 p-3 rounded-xl border border-emerald-500/30 bg-emerald-900/20 shadow-[0_0_15px_rgba(16,185,129,0.15)]">
               <div className="relative flex items-center justify-center w-3 h-3">
-                <span className="absolute inline-flex w-full h-full rounded-full opacity-75 bg-emerald-400 animate-ping"></span>
-                <span className="relative inline-flex w-2 h-2 rounded-full bg-emerald-500"></span>
+                <span className="absolute inline-flex w-full h-full rounded-full opacity-75 bg-emerald-400 animate-ping" />
+                <span className="relative inline-flex w-2 h-2 rounded-full bg-emerald-500" />
               </div>
               <span className="font-jakarta text-[10px] text-emerald-300 font-bold uppercase tracking-wider">
                 📡 ESP32 Live Connected
@@ -1031,14 +1205,13 @@ export default function App() {
 
         {/* System health pills */}
         <div className="mt-4">
-          <p className="font-jakarta text-[9px] text-gray-700 uppercase tracking-widest mb-2">
-            System Health
-          </p>
+          <p className="font-jakarta text-[9px] text-gray-700 uppercase tracking-widest mb-2">System Health</p>
           <div className="flex flex-col gap-1.5">
-            <Pill ok={!!health}                     label={health ? 'API Active'     : 'API Offline'}  />
+            <Pill ok={!!health}                     label={health ? 'API Active'     : 'API Offline'} />
             <Pill ok={health?.database_available}   label={health?.database_available ? 'DB Synced' : 'DB Error'} />
             <Pill ok={health?.upload_dir_available} label="Upload Dir" />
             <Pill ok={health?.model_file_loaded}    label={health?.model_file_loaded  ? 'Model Active' : 'No Checkpoint'} />
+            <Pill ok={wsState === 'open'}            label={wsState === 'open' ? 'WS Connected' : 'WS Offline'} />
           </div>
         </div>
 
@@ -1060,7 +1233,7 @@ export default function App() {
               Environmental Biodiversity Dashboard
             </h1>
             <p className="font-grotesk text-[10px] text-gray-600">
-              UNIBEN Field Station · 5-Parameter Telemetry · Dual-View CV Pipeline
+              UNIBEN Field Station · 6-Parameter Telemetry · Dual-View CV Pipeline · SD Card Contingency
             </p>
           </div>
           <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px]
@@ -1095,15 +1268,15 @@ export default function App() {
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.18 }}
             >
-              <TelemetryTab readings={readings} histories={histories} />
+              <TelemetryTab readings={readings} histories={histories} geoCoords={geoCoords} wsState={wsState} />
             </motion.div>
           )}
-          {activeTab === 'manual' && (
-            <motion.div key="manual"
+          {activeTab === 'sync' && (
+            <motion.div key="sync"
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.18 }}
             >
-              <ManualOverrideTab onEngaged={refreshAll} />
+              <SDSyncTab onPipelineComplete={refreshAll} />
             </motion.div>
           )}
           {activeTab === 'media' && (
@@ -1115,9 +1288,8 @@ export default function App() {
             </motion.div>
           )}
         </AnimatePresence>
-        
-        <ReportFooter />
 
+        <ReportFooter />
 
       </main>
     </div>

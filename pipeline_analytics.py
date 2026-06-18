@@ -84,6 +84,7 @@ SENSOR_FIELDS: List[str] = [
     "pressure_hPa",
     "light_lux",
     "sound_db",
+    "altitude_m",
 ]
 
 FIELD_LABELS: Dict[str, str] = {
@@ -92,12 +93,14 @@ FIELD_LABELS: Dict[str, str] = {
     "pressure_hPa":     "Pressure (hPa)",
     "light_lux":        "Light (Lux)",
     "sound_db":         "Sound (dB)",
+    "altitude_m":       "Altitude (m)",
 }
 
 # Physical plausibility bounds for outlier clamping (used as fallback)
 FIELD_BOUNDS: Dict[str, Tuple[float, float]] = {
-    "temperature_c":    (-40.0,  85.0),
-    "humidity_percent": (  0.0, 100.0),
+    "temperature_c":    (-40.0,   85.0),
+    "humidity_percent": (  0.0,  100.0),
+    "altitude_m":       (-500.0, 9000.0),
     "pressure_hPa":     (800.0, 1100.0),
     "light_lux":        (  0.0, 150_000.0),
     "sound_db":         (  0.0,  140.0),
