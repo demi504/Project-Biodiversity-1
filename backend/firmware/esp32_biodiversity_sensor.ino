@@ -44,8 +44,11 @@
 // ─── Network constants ───────────────────────────────────────────────────────
 
 // WiFi credentials — campus wireless network
-const char* WIFI_SSID     = "Demmy";         // WiFi network name
-const char* WIFI_PASSWORD = "itzdemi21";     // WiFi network password
+// ⚠ SECURITY: Replace with your actual credentials before flashing.
+//   Do NOT commit real passwords to version control.
+//   Copy firmware_secrets_template.h → firmware_secrets.h and fill in values.
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";      // e.g. "Demmy"
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";   // your WiFi passphrase
 
 // FastAPI backend — laptop wireless IPv4 on the same LAN
 const char* SERVER_HOST   = "10.235.213.234"; // Laptop LAN IP (uvicorn --host 0.0.0.0)

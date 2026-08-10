@@ -1,6 +1,6 @@
-testsprite_tests\tmp\config.json
+testsprite_tests/tmp/config.json
 
-# Python
+# ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.pyo
@@ -10,19 +10,38 @@ dist/
 build/
 *.egg
 
-# Virtual environment
+# ── Virtual environment ──────────────────────────────────────────────────────
 .venv/
 venv/
 env/
 
-# Environment variables
+# ── Environment variables ────────────────────────────────────────────────────
 .env
+.env.local
 
-# IDE
+# ── IDE ──────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *~
 
-# Streamlit
+# ── Streamlit ────────────────────────────────────────────────────────────────
 .streamlit/secrets.toml
+
+# ── Backend runtime data (SQLite WAL, uploads, exports) ──────────────────────
+data/biodiversity.db-shm
+data/biodiversity.db-wal
+data/uploads/
+data/exports/
+backend/data/biodiversity.db-shm
+backend/data/biodiversity.db-wal
+backend/data/uploads/
+backend/data/exports/
+
+# ── Firmware secrets (never commit real credentials) ─────────────────────────
+backend/firmware/firmware_secrets.h
+firmware/firmware_secrets.h
+
+# ── Frontend build output ────────────────────────────────────────────────────
+frontend/dist/
+frontend/node_modules/
