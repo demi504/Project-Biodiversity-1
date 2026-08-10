@@ -718,18 +718,21 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
-# CORS — React Vite dev server (5173) and direct localhost access
+# CORS — Vite dev server, localhost, and all LAN hardware origins
+#
+# allow_origins=["*"] is intentional for local-network field deployments:
+#   • ESP32 firmware initiates WebSocket upgrade from 10.x.x.x LAN IPs.
+#   • FastAPI's Starlette WebSocket middleware checks the Origin header on
+#     the HTTP Upgrade request; a restrictive origin list silently rejects
+#     the handshake, leaving the sensor stream dead.
+#   • This server is LAN-only (bound to 0.0.0.0:8000, not internet-exposed),
+#     so wildcard origins carry no meaningful security risk here.
 # ---------------------------------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],            # Accept WS upgrade from any LAN IP (ESP32, browser, etc.)
+    allow_credentials=False,        # Must be False when allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1839,3 +1842,23 @@ def share_email(payload: EmailShareRequest) -> Dict[str, str]:
         daemon=True,
     ).start()
     return {"status": "dispatched", "message": f"Email queued for dispatch to {payload.email}."}
+
+
+# ---------------------------------------------------------------------------
+# Entry-point — enforces 0.0.0.0:8000 binding when run directly
+#
+# Binding to 0.0.0.0 (all interfaces) is required so the ESP32 firmware can
+# reach the WebSocket endpoint at ws://10.235.213.234:8000/ws/telemetry from
+# the local wireless network.  Running as:
+#   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+# is equivalent and preferred for development hot-reload.
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",   # Accept on all interfaces — LAN + loopback (required for ESP32)
+        port=8000,         # Must match ESP32 firmware SERVER_PORT constant
+        reload=False,      # Set True for local dev hot-reload
+    )
