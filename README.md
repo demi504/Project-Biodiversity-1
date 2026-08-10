@@ -1,6 +1,6 @@
 # UNIBEN Biodiversity Pipeline
 
-**Thesis project** — *Development of a campus-scale biodiversity and environmental data pipeline using drone imagery and sensor integration for machine learning application: A case study for UNIBEN Ugbowo campus.*
+**Thesis project** — *Development of a campus-scale biodiversity and environmental data pipeline using ground-level species classification and sensor-fused micro-climate telemetry for machine learning application: A case study for UNIBEN Ugbowo campus.*
 
 ---
 
