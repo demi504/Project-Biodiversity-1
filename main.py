@@ -9,13 +9,14 @@ Thesis: "Development of a campus-scale biodiversity and environmental data
 Domains implemented
 -------------------
   1. SQLite WAL mode + schema: sensor_readings (unique composite index),
-     external_weather_metadata, taxonomic_metadata.
+     external_weather_metadata, taxonomic_metadata, ground_image_uploads.
   2. Manual override backend completely removed.
   3. WebSocket /ws/telemetry — merges ESP32 stream with browser geolocation.
   4. POST /api/telemetry/upload-contingency — idempotent SD card CSV parser.
   5. GET  /api/weather/field-day — OpenWeatherMap micro-climate baseline.
-     Background PlantNet taxonomy tagging on each ground image upload.
   6. POST /api/v1/analytics/run-pipeline — unified data science engine.
+  7. POST /api/v1/upload-ground-image — single ground image CV + telemetry fusion.
+     (Replaces dual-view drone endpoints, which are now deprecated.)
 
 Run locally:
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -145,11 +146,22 @@ class ImageClassificationResponse(BaseModel):
 
 
 class CVInferenceResponse(BaseModel):
-    """Computer-vision classification response for uploaded drone imagery."""
+    """Computer-vision classification response for uploaded ground imagery."""
     status:          str
     predicted_label: str
     taxonomy:        Dict[str, str]
     confidence:      float
+
+
+class GroundImageUploadResponse(BaseModel):
+    """Structured response for a single ground image classification with telemetry fusion."""
+    image_id:                       int
+    species_prediction:             str
+    confidence_score:               float
+    timestamp:                      datetime
+    latitude:                       Optional[float]
+    longitude:                      Optional[float]
+    environmental_telemetry_snapshot: Dict[str, Any]
 
 
 class HealthResponse(BaseModel):
@@ -405,6 +417,25 @@ def init_database() -> None:
                 confidence   REAL,
                 raw_response TEXT,
                 created_at   TEXT    NOT NULL
+            )
+            """
+        )
+
+        # ── ground_image_uploads ────────────────────────────────────────────
+        # Ground-only CV inference + concurrent micro-climate snapshot.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ground_image_uploads (
+                image_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_filename     TEXT    NOT NULL,
+                stored_filename       TEXT    NOT NULL,
+                stored_path           TEXT    NOT NULL,
+                species_prediction    TEXT,
+                confidence_score      REAL,
+                latitude              REAL,
+                longitude             REAL,
+                environmental_telemetry TEXT,
+                timestamp             TEXT    NOT NULL
             )
             """
         )
@@ -1224,101 +1255,129 @@ def list_image_classifications(
 
 
 # ---------------------------------------------------------------------------
-# Domain 4 (preserved) — Drone patch upload
+# Ground-image upload endpoint (replaces dual-view drone workflow)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/upload-ground-image", response_model=GroundImageUploadResponse)
+async def upload_ground_image(
+    file:      UploadFile       = File(...),
+    latitude:  Optional[float] = Form(None),
+    longitude: Optional[float] = Form(None),
+) -> GroundImageUploadResponse:
+    """
+    Accept a single ground-level image, run CV inference, and fuse with the
+    latest concurrent environmental sensor telemetry snapshot.
+
+    Steps:
+      1. Validate and save image to disk (UUIDv4 filename).
+      2. Run local MobileNetV3 / ResNet50 inference via BiodiversityModelManager.
+      3. Fetch the most recent sensor_readings row as micro-climate snapshot.
+      4. Insert into ground_image_uploads (WAL-safe).
+      5. Return GroundImageUploadResponse with prediction + telemetry fusion data.
+    """
+    extension                              = validate_image_upload(file)
+    stored_filename, stored_path, _        = save_upload_to_disk(file, extension)
+    inference                              = _run_cv_inference(stored_path, file.filename or stored_filename)
+    created_at                             = utc_now()
+
+    # ── Fetch latest sensor snapshot for micro-climate fusion ───────────────
+    telemetry_snapshot: Dict[str, Any] = {}
+    try:
+        with get_connection() as snap_conn:
+            snap_row = snap_conn.execute(
+                """
+                SELECT temperature_c, humidity_percent, pressure_hPa,
+                       light_lux, sound_db, altitude_m
+                FROM sensor_readings
+                ORDER BY observed_at DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if snap_row:
+                telemetry_snapshot = {
+                    "temperature_c":    snap_row["temperature_c"],
+                    "humidity_percent": snap_row["humidity_percent"],
+                    "pressure_hPa":     snap_row["pressure_hPa"],
+                    "light_lux":        snap_row["light_lux"],
+                    "sound_db":         snap_row["sound_db"],
+                    "altitude_m":       snap_row["altitude_m"],
+                }
+    except sqlite3.Error:
+        pass  # Non-fatal — snapshot stays empty dict
+
+    # ── Persist to ground_image_uploads ─────────────────────────────────
+    try:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO ground_image_uploads (
+                    original_filename, stored_filename, stored_path,
+                    species_prediction, confidence_score,
+                    latitude, longitude,
+                    environmental_telemetry, timestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file.filename or "unknown",
+                    stored_filename,
+                    str(stored_path),
+                    inference["predicted_label"],
+                    inference["confidence"],
+                    latitude,
+                    longitude,
+                    _json.dumps(telemetry_snapshot),
+                    to_iso(created_at),
+                ),
+            )
+            conn.commit()
+            image_id = cursor.lastrowid
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Image saved but ground upload metadata could not be stored: {exc}",
+        ) from exc
+
+    return GroundImageUploadResponse(
+        image_id=image_id,
+        species_prediction=inference["predicted_label"] or "Unclassified",
+        confidence_score=inference["confidence"] or 0.0,
+        timestamp=created_at,
+        latitude=latitude,
+        longitude=longitude,
+        environmental_telemetry_snapshot=telemetry_snapshot,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Domain 4 (deprecated) — Drone patch upload (410 Gone)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/upload-drone-patch")
-async def upload_drone_patch(
-    drone_file:  UploadFile = File(...),
-    campus_zone: str        = Form("Zone 1"),
-) -> Dict[str, Any]:
-    """Accept aerial drone map frame, save with UUIDv4 filename, record patch."""
-    ext = validate_image_upload(drone_file)
-    _, stored_path, _ = save_upload_to_disk(drone_file, ext)
-
-    with get_connection() as conn:
-        cursor = conn.execute(
-            "INSERT INTO drone_patches (drone_image_path, campus_zone, flight_timestamp) VALUES (?, ?, ?)",
-            (str(stored_path), campus_zone, to_iso(utc_now())),
-        )
-        drone_id = cursor.lastrowid
-        conn.commit()
-
-    return {"status": "success", "drone_id": drone_id, "drone_image_path": str(stored_path)}
+async def upload_drone_patch_deprecated() -> None:
+    """DEPRECATED: Aerial drone patch upload removed. Use /api/v1/upload-ground-image."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "The aerial drone patch upload endpoint has been retired. "
+            "Please use POST /api/v1/upload-ground-image for ground-level species ingestion."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Ground batch upload — with PlantNet taxonomy background worker
+# Ground batch upload (deprecated — 410 Gone)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/upload-ground-batch")
-async def upload_ground_batch(
-    drone_id:     Optional[int]       = Form(None),
-    ground_files: List[UploadFile]    = File(...),
-    observer_id:  str                 = Form("System"),
-) -> Dict[str, Any]:
-    """
-    Accept batch ground close-up images.
-
-    For each image:
-      1. Save to disk with UUIDv4 filename (path-traversal safe).
-      2. Run local CV inference.
-      3. Insert into field_observations.
-      4. Fire background PlantNet taxonomy thread — non-blocking.
-    """
-    results: List[Dict[str, Any]] = []
-
-    with get_connection() as conn:
-        for f in ground_files:
-            if not f.filename:
-                continue
-            try:
-                ext = validate_image_upload(f)
-                _, stored_path, _ = save_upload_to_disk(f, ext)
-                inference = _run_cv_inference(stored_path, f.filename)
-
-                label = inference.get("predicted_label", "Unclassified")
-                conf  = float(inference.get("confidence", 0.0))
-                tax   = inference.get("taxonomy", {})
-                now   = utc_now()
-
-                cur = conn.execute(
-                    """
-                    INSERT INTO field_observations (
-                        drone_id, ground_image_path,
-                        category, kingdom, phylum, class, order_name,
-                        family, genus, species, common_name,
-                        annotation_confidence,
-                        observer_id, date, time, data_source
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL_OVERRIDE')
-                    """,
-                    (
-                        drone_id, str(stored_path),
-                        tax.get("category"),  tax.get("Kingdom"), tax.get("Phylum"),
-                        tax.get("Class"),     tax.get("Order"),   tax.get("Family"),
-                        tax.get("Genus"),     tax.get("Species"), label,
-                        conf, observer_id,
-                        now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"),
-                    ),
-                )
-                obs_id = cur.lastrowid
-
-                # Fire-and-forget PlantNet background tagging
-                if PLANTNET_API_KEY:
-                    t = threading.Thread(
-                        target=_plantnet_tag,
-                        args=(obs_id, stored_path),
-                        daemon=True,
-                    )
-                    t.start()
-
-                results.append({"file": f.filename, "status": "success", "inference": inference, "obs_id": obs_id})
-            except Exception as e:
-                results.append({"file": f.filename, "status": "error", "message": str(e)})
-
-        conn.commit()
-
-    return {"status": "success", "results": results}
+async def upload_ground_batch_deprecated() -> None:
+    """DEPRECATED: Batch ground upload removed. Use /api/v1/upload-ground-image per image."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "The batch ground upload endpoint has been retired. "
+            "Please use POST /api/v1/upload-ground-image for individual ground-level species ingestion."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

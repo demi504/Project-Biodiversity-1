@@ -1,7 +1,7 @@
 {
-  "status": "init",
-  "scope": "codebase",
+  "status": "commited",
   "type": "backend",
-  "localEndpoint": "http://localhost:8000/",
-  "serverPort": 13165
+  "scope": "codebase",
+  "localEndpoint": "http://localhost:8000",
+  "backendAuthType": "public"
 }

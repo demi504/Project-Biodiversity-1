@@ -1,0 +1,198 @@
+version: "2"
+type: backend
+tech_stack:
+  - language: Python
+  - framework: FastAPI
+  - database: SQLite with WAL mode
+  - other: Pydantic models, WebSocket, CORS
+features:
+  - name: Health Check and Hardware Status
+    description: System health and hardware availability monitoring
+    files:
+      - main.py
+    endpoints:
+      - method: GET
+        path: /health
+        description: Returns system health status including database and upload directory availability
+        auth_required: false
+        response_schema:
+          "200": HealthResponse
+      - method: GET
+        path: /api/v1/hardware/status
+        description: Returns hardware status information
+        auth_required: false
+        response_schema:
+          "200": HardwareStatusResponse
+  
+  - name: Sensor Telemetry Management
+    description: Environmental sensor reading collection from ESP32 devices
+    files:
+      - main.py
+    endpoints:
+      - method: POST
+        path: /api/v1/sensor-readings
+        description: Create a new sensor reading with 8 environmental parameters
+        auth_required: false
+        request_schema:
+          body:
+            device_id: string
+            temperature_c: number
+            humidity_percent: number
+            pressure_hPa: number
+            light_lux: number
+            sound_db: number
+            altitude_m: number (optional)
+            latitude: number (optional)
+            longitude: number (optional)
+            observed_at: datetime (optional)
+            notes: string (optional)
+            data_source: string
+        response_schema:
+          "201": SensorReadingResponse
+          "422": Validation error
+      - method: GET
+        path: /sensor-readings
+        description: List all sensor readings with optional filtering
+        auth_required: false
+        response_schema:
+          "200": SensorReadingResponse[]
+      - method: GET
+        path: /ws/telemetry
+        description: WebSocket for real-time telemetry streaming merging ESP32 data with browser geolocation
+        auth_required: false
+        response_schema:
+          "101": WebSocket upgrade
+
+  - name: Image Classification and Management
+    description: Drone image upload and computer vision classification
+    files:
+      - main.py
+    endpoints:
+      - method: POST
+        path: /api/v1/upload-image
+        description: Upload drone image and run ML inference
+        auth_required: false
+        request_schema:
+          multipart:
+            image: file
+            sensor_reading_id: integer (optional)
+        response_schema:
+          "200": CVInferenceResponse
+          "413": File too large
+          "422": Validation error
+      - method: POST
+        path: /api/v1/upload-drone-patch
+        description: Upload drone patch image with metadata
+        auth_required: false
+        request_schema:
+          multipart:
+            image: file
+            campus_zone: string
+            flight_timestamp: string
+        response_schema:
+          "201": Success message
+          "415": Unsupported media type
+      - method: POST
+        path: /api/v1/upload-ground-batch
+        description: Batch upload ground observation images with taxonomic metadata
+        auth_required: false
+        request_schema:
+          multipart:
+            image_files: file[] (multiple)
+            campus_zone: string
+            species_name: string
+            common_name: string
+            gps_lat: number
+            gps_long: number
+        response_schema:
+          "201": Success message
+      - method: GET
+        path: /image-classifications
+        description: Retrieve all image classification records
+        auth_required: false
+        response_schema:
+          "200": ImageClassificationResponse[]
+
+  - name: Contingency SD Card Upload
+    description: Idempotent parsing of ESP32 SD card CSV data dumps
+    files:
+      - main.py
+    endpoints:
+      - method: POST
+        path: /api/telemetry/upload-contingency
+        description: Upload SD card CSV with sensor readings (idempotent via composite index)
+        auth_required: false
+        request_schema:
+          multipart:
+            csv_file: file
+        response_schema:
+          "200": SDCardUploadResponse
+          "400": Bad request
+
+  - name: Weather Integration
+    description: OpenWeatherMap micro-climate baseline integration
+    files:
+      - main.py
+    endpoints:
+      - method: GET
+        path: /api/weather/field-day
+        description: Fetch ambient weather metrics and compare with sensor data
+        auth_required: false
+        query_params:
+          latitude: number
+          longitude: number
+        response_schema:
+          "200": WeatherFieldDayResponse
+          "400": Missing coordinates
+
+  - name: Analytics Pipeline
+    description: Unified data science engine for analysis and reporting
+    files:
+      - main.py
+      - enrich_pipeline.py
+      - pipeline_analytics.py
+      - pipeline_sync.py
+      - report_engine.py
+    endpoints:
+      - method: POST
+        path: /api/v1/analytics/run-pipeline
+        description: Execute full data processing and ML pipeline
+        auth_required: false
+        request_schema:
+          body:
+            query: string (optional)
+        response_schema:
+          "202": RunPipelineResponse
+      - method: GET
+        path: /api/v1/reports/export-excel
+        description: Export analytics results as Excel file
+        auth_required: false
+        response_schema:
+          "200": File (Excel)
+          "404": No report available
+      - method: POST
+        path: /api/v1/reports/share-email
+        description: Share reports via email with optional PDF/Excel attachments
+        auth_required: false
+        request_schema:
+          body:
+            email: string
+            attach_pdf: boolean
+            attach_excel: boolean
+        response_schema:
+          "200": Success message
+          "400": Invalid email
+
+known_limitations:
+  - issue: No input validation on latitude/longitude range in some endpoints
+    location: main.py - image upload endpoints
+    impact: May accept invalid geographic coordinates
+  - issue: File upload size limit not explicitly enforced in all endpoints
+    location: main.py - upload endpoints
+    impact: Large files might consume excessive disk space
+  - issue: PLANTNET_API_KEY and OPENWEATHERMAP_API_KEY can be missing
+    location: main.py - _load_dotenv function
+    impact: External API calls will fail silently if keys are not configured
+  - issue: WebSocket connection state management not fully robust
+    location: main.py - /ws/telemetry endpoint
+    impact: Dropped connections may cause data loss

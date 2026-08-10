@@ -1,16 +1,17 @@
 /**
- * UNIBEN Biodiversity Pipeline — Premium React Dashboard v4
+ * UNIBEN Biodiversity Pipeline — Premium React Dashboard v5
  *
  * Tab 1 — Live Telemetry   : 6-param metric cards + sparklines + provenance toggle
  * Tab 2 — Field Sync Hub   : ENGAGE PIPELINE ENGINE + Excel download
- * Tab 3 — Field Media      : Aerial Context Frame + Batch Ground + SD Card Contingency
+ * Tab 3 — Ground Ingestion : Single-image species CV + Micro-Climate Data Fusion + SD Card
  *
  * Six parameters streamed from ESP32 + browser geolocation:
  *   Temperature (°C) · Humidity (%) · Pressure (hPa) · Light (Lux) · Sound (dB) · Altitude (m)
  *
  * Domain 2: Manual Override tab completely removed.
  * Domain 3: navigator.geolocation auto-captured; WebSocket /ws/telemetry client integrated.
- * Domain 4: SD Card Contingency drop zone added to Field Media tab.
+ * Domain 4: SD Card Contingency drop zone retained in Ground Ingestion tab.
+ * Domain 5: Aerial/drone dual-view replaced with ground-only CV + telemetry fusion.
  */
 
 import { useState, useEffect, useCallback, useRef, memo } from 'react';
@@ -20,11 +21,10 @@ import {
   Activity, RefreshCw, CheckCircle2, XCircle,
   Wifi, WifiOff, Cpu, Database, UploadCloud,
   BarChart2, Zap, Filter, ChevronRight, Download,
-  Camera, ImagePlus, FlaskConical, Layers,
-  HardDrive, MapPin, AlertTriangle,
+  Camera, ImagePlus, Layers, Leaf,
+  HardDrive, MapPin, AlertTriangle, FlaskConical, ScanSearch,
 } from 'lucide-react';
 import { ResponsiveContainer, LineChart, Line, Tooltip } from 'recharts';
-
 /* ─────────────────────────────────────────────────────────────────────────── */
 const API     = 'http://127.0.0.1:8000';
 const WS_URL  = 'ws://127.0.0.1:8000/ws/telemetry';
@@ -749,203 +749,275 @@ function SDCardDropZone() {
   );
 }
 
-/* ── Field Media Tab ─────────────────────────────────────────────────────── */
+/* ── Ground Species Ingestion Zone (Tab 3) ───────────────────────────────── */
 
-function FieldMediaTab({ onSessionCreated }) {
-  const [droneFile,    setDroneFile]    = useState(null);
-  const [dronePreview, setDronePreview] = useState(null);
-  const [campusZone,   setCampusZone]   = useState('Zone 1');
-  const [groundFiles,  setGroundFiles]  = useState([]);
-  const [uploading,    setUploading]    = useState(false);
-  const [result,       setResult]       = useState(null);
-  const [error,        setError]        = useState('');
+function FieldMediaTab({ onSessionCreated, geoCoords, readings }) {
+  const [groundFile,  setGroundFile]  = useState(null);
+  const [preview,     setPreview]     = useState(null);
+  const [uploading,   setUploading]   = useState(false);
+  const [result,      setResult]      = useState(null);
+  const [error,       setError]       = useState('');
 
-  const handleDroneDrop = useCallback(file => {
-    setDroneFile(file);
-    setDronePreview(URL.createObjectURL(file));
+  const handleFileDrop = useCallback(file => {
+    setGroundFile(file);
+    setPreview(URL.createObjectURL(file));
+    setResult(null);
+    setError('');
   }, []);
 
-  const handleGroundDrop = useCallback(e => {
-    e.preventDefault();
-    const files = Array.from(e.dataTransfer?.files || e.target.files || []);
-    setGroundFiles(prev => [...prev, ...files]);
-  }, []);
-
-  const removeGroundFile = useCallback(idx => {
-    setGroundFiles(prev => prev.filter((_, i) => i !== idx));
-  }, []);
+  const dd = useDragDrop(handleFileDrop);
 
   const submit = useCallback(async () => {
-    if (!droneFile && groundFiles.length === 0) {
-      setError('Drop at least one aerial frame or ground images before submitting.');
+    if (!groundFile) {
+      setError('Drop a ground image before classifying.');
       return;
     }
     setUploading(true);
     setError('');
     setResult(null);
     try {
-      let droneId = null;
-      if (droneFile) {
-        const droneFd = new FormData();
-        droneFd.append('drone_file', droneFile);
-        droneFd.append('campus_zone', campusZone);
-        const droneRes = await fetch(`${API}/api/v1/upload-drone-patch`, { method: 'POST', body: droneFd });
-        if (!droneRes.ok) throw new Error(`Drone upload HTTP ${droneRes.status}`);
-        const droneData = await droneRes.json();
-        droneId = droneData.drone_id;
-      }
-
-      let groundData = null;
-      if (groundFiles.length > 0) {
-        const groundFd = new FormData();
-        if (droneId) groundFd.append('drone_id', droneId);
-        groundFd.append('observer_id', 'System');
-        groundFiles.forEach(f => groundFd.append('ground_files', f));
-        const groundRes = await fetch(`${API}/api/v1/upload-ground-batch`, { method: 'POST', body: groundFd });
-        if (!groundRes.ok) throw new Error(`Ground upload HTTP ${groundRes.status}`);
-        groundData = await groundRes.json();
-      }
-
-      setResult({ droneId, groundResults: groundData?.results });
+      const fd = new FormData();
+      fd.append('file', groundFile);
+      if (geoCoords?.latitude  != null) fd.append('latitude',  geoCoords.latitude);
+      if (geoCoords?.longitude != null) fd.append('longitude', geoCoords.longitude);
+      const res = await fetch(`${API}/api/v1/upload-ground-image`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
+      const data = await res.json();
+      setResult(data);
       onSessionCreated?.();
     } catch (err) {
       setError(err.message);
     } finally {
       setUploading(false);
     }
-  }, [droneFile, groundFiles, campusZone, onSessionCreated]);
+  }, [groundFile, geoCoords, onSessionCreated]);
 
   const reset = useCallback(() => {
-    setDroneFile(null); setDronePreview(null);
-    setGroundFiles([]); setResult(null); setError('');
+    setGroundFile(null);
+    setPreview(null);
+    setResult(null);
+    setError('');
   }, []);
+
+  /* Latest sensor snapshot for the fusion card */
+  const latestReading = readings?.[0] ?? null;
+
+  const ENV_PARAMS = [
+    { key: 'temperature_c',    label: 'Temp',      unit: '°C',  color: '#f97316', Icon: Thermometer },
+    { key: 'humidity_percent', label: 'Humidity',  unit: '%',   color: '#38bdf8', Icon: Droplets },
+    { key: 'pressure_hPa',    label: 'Pressure',  unit: ' hPa',color: '#a78bfa', Icon: Gauge },
+    { key: 'light_lux',        label: 'Light',     unit: ' Lux',color: '#fbbf24', Icon: Sun },
+    { key: 'sound_db',         label: 'Sound',     unit: ' dB', color: '#34d399', Icon: Volume2 },
+    { key: 'altitude_m',       label: 'Altitude',  unit: ' m',  color: '#2dd4bf', Icon: Mountain },
+  ];
 
   return (
     <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-4">
+
+      {/* ── Header ── */}
       <motion.div variants={panelV} className="flex items-center gap-2">
-        <ImagePlus size={12} className="text-emerald-500" />
+        <Leaf size={12} className="text-emerald-500" />
         <span className="font-jakarta text-[9px] text-gray-600 uppercase tracking-widest">
-          Field Media &amp; Spatial Mapping Workspace
+          Ground Species Ingestion Zone · Computer Vision + Micro-Climate Fusion
         </span>
       </motion.div>
 
-      {/* ── Aerial Frame + Ground Batch (UNTOUCHED) ── */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        {/* Left: Drone Image & Zone */}
-        <div className="lg:col-span-1 space-y-4">
-          <ImageDropZone
-            label="Aerial Context Frame"
-            subtitle="Drop a single drone map"
-            icon={Camera}
-            file={droneFile}
-            preview={dronePreview}
-            onFile={handleDroneDrop}
-            accentColor="#34d399"
-          />
-          <motion.div variants={panelV} className="glass p-4 space-y-2">
-            <label className="font-jakarta text-[9px] text-gray-500 uppercase tracking-wider">Campus Zone</label>
-            <select
-              value={campusZone} onChange={e => setCampusZone(e.target.value)}
-              className="w-full bg-white/5 border border-emerald-900/30 rounded-lg px-3 py-2 text-[11px] font-grotesk focus:outline-none"
-            >
-              {[...Array(10)].map((_, i) => (
-                <option key={i} value={`Zone ${i + 1}`} className="bg-[#0B0F19]">Zone {i + 1}</option>
-              ))}
-            </select>
-          </motion.div>
+      {/* ── Single-image drop zone ── */}
+      <motion.div variants={panelV} className="glass p-4 flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <ScanSearch size={13} className="text-emerald-400" />
+          <div>
+            <p className="font-jakarta text-[11px] font-semibold text-emerald-300">Species Image Upload</p>
+            <p className="font-grotesk text-[9px] text-gray-600">
+              Drop a single ground-level photo · ResNet50 / MobileNetV3 CV inference
+            </p>
+          </div>
         </div>
 
-        {/* Right: Ground Batch */}
-        <div className="lg:col-span-2">
-          <motion.div variants={panelV} className="glass p-4 h-full flex flex-col gap-3">
-            <div className="flex items-center gap-2">
-              <FlaskConical size={13} className="text-orange-400" />
-              <div>
-                <p className="font-jakarta text-[11px] font-semibold text-orange-400">Batch Ground Taxon Capture</p>
-                <p className="font-grotesk text-[9px] text-gray-600">Upload multiple ground images · PlantNet taxonomy runs in background</p>
-              </div>
-            </div>
-
-            <div
-              onDragOver={e => e.preventDefault()}
-              onDrop={handleGroundDrop}
-              className="flex-1 rounded-xl border-2 border-dashed border-orange-500/40 bg-orange-500/5
-                flex flex-col items-center justify-center gap-2 p-6 cursor-pointer hover:bg-orange-500/10 transition-colors"
-              onClick={() => document.getElementById('batch-upload').click()}
-            >
-              <input id="batch-upload" type="file" multiple accept="image/*" className="hidden" onChange={handleGroundDrop} />
-              <UploadCloud size={26} className="text-orange-400 opacity-50" />
-              <p className="font-jakarta text-[10px] text-gray-600">Drop multiple images here</p>
-            </div>
-
-            {groundFiles.length > 0 && (
-              <div className="grid grid-cols-4 gap-2 mt-2">
-                {groundFiles.map((f, i) => (
-                  <div key={i} className="relative aspect-square rounded-lg border border-emerald-900/30 overflow-hidden group">
-                    <img src={URL.createObjectURL(f)} className="w-full h-full object-cover" />
-                    <button onClick={() => removeGroundFile(i)}
-                      className="absolute top-1 right-1 bg-red-500/80 text-white rounded-full p-0.5 opacity-0 group-hover:opacity-100">
-                      <XCircle size={10} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </motion.div>
-        </div>
-      </div>
-
-      {/* Submit / Clear buttons */}
-      <motion.div variants={panelV} className="flex gap-3">
-        <motion.button
-          onClick={submit} disabled={uploading || (!droneFile && groundFiles.length === 0)}
-          className="flex-1 py-3 rounded-xl font-jakarta font-bold text-sm tracking-wide flex items-center justify-center gap-2 disabled:opacity-40"
-          style={{ background: 'linear-gradient(135deg, #10B981, #047857)', boxShadow: '0 0 20px rgba(16,185,129,0.2)' }}
+        <div
+          ref={dd.ref}
+          onDragOver={dd.onDragOver}
+          onDragLeave={dd.onDragLeave}
+          onDrop={dd.onDrop}
+          onClick={() => dd.ref.current?.querySelector('input')?.click()}
+          className="relative rounded-xl border-2 border-dashed cursor-pointer
+            flex flex-col items-center justify-center gap-2 p-6 transition-all duration-300"
+          style={{
+            borderColor: dd.dragging ? '#34d399' : '#34d39944',
+            background:  dd.dragging ? '#34d39911' : 'transparent',
+            minHeight:   preview ? 'auto' : 180,
+          }}
         >
-          {uploading ? <><RefreshCw size={14} className="animate-spin" />Processing Batch…</> : <><UploadCloud size={14} />Submit Dual-View Data</>}
-        </motion.button>
-        {(droneFile || groundFiles.length > 0 || result) && (
-          <button onClick={reset} className="px-4 py-3 rounded-xl glass border border-emerald-900/30 font-jakarta text-[10px] text-gray-500 hover:text-gray-300">Clear</button>
-        )}
+          <input type="file" accept="image/*" className="hidden" onChange={dd.onInput} />
+          {preview ? (
+            <div className="w-full">
+              <img src={preview} alt="Ground species" className="w-full rounded-lg object-contain max-h-64" />
+              <p className="font-grotesk text-[9px] text-gray-600 text-center mt-2 truncate">{groundFile?.name}</p>
+            </div>
+          ) : (
+            <>
+              <UploadCloud size={32} className="text-emerald-500 opacity-40" />
+              <p className="font-jakarta text-[11px] text-gray-500">Drag &amp; drop or click to select</p>
+              <p className="font-grotesk text-[9px] text-gray-700">JPG · PNG · TIFF · WebP</p>
+            </>
+          )}
+        </div>
+
+        {/* Action buttons */}
+        <div className="flex gap-3">
+          <motion.button
+            onClick={submit}
+            disabled={uploading || !groundFile}
+            whileHover={{ scale: uploading || !groundFile ? 1 : 1.015, boxShadow: '0 0 30px rgba(52,211,153,0.3)' }}
+            whileTap={{ scale: 0.98 }}
+            className="flex-1 py-3 rounded-xl font-jakarta font-bold text-sm tracking-wide
+              flex items-center justify-center gap-2 transition-all duration-300
+              disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{
+              background: uploading
+                ? 'linear-gradient(135deg, #064E3B, #065F46)'
+                : 'linear-gradient(135deg, #10B981, #059669, #047857)',
+              boxShadow: uploading || !groundFile ? 'none' : '0 0 24px rgba(16,185,129,0.25)',
+            }}
+          >
+            {uploading
+              ? <><RefreshCw size={14} className="animate-spin" />Classifying…</>
+              : <><Camera size={14} />Classify Species</>
+            }
+          </motion.button>
+          {(groundFile || result) && (
+            <button
+              onClick={reset}
+              className="px-4 py-3 rounded-xl glass border border-emerald-900/30
+                font-jakarta text-[10px] text-gray-500 hover:text-gray-300 transition-colors"
+            >
+              Clear
+            </button>
+          )}
+        </div>
       </motion.div>
 
-      {/* Image upload result */}
+      {/* ── Error ── */}
       <AnimatePresence>
         {error && (
-          <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-            className="glass border border-red-700/40 p-3 rounded-xl flex items-start gap-2">
-            <XCircle size={12} className="text-red-400 mt-0.5" />
+          <motion.div
+            initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+            className="glass border border-red-700/40 p-3 rounded-xl flex items-start gap-2"
+          >
+            <XCircle size={12} className="text-red-400 mt-0.5 shrink-0" />
             <p className="font-grotesk text-[10px] text-red-300">{error}</p>
-          </motion.div>
-        )}
-        {result && (
-          <motion.div variants={panelV} className="glass border border-emerald-600/30 p-4 rounded-xl space-y-2">
-            <div className="flex items-center gap-2">
-              <CheckCircle2 size={13} className="text-emerald-400" />
-              <p className="font-jakarta text-[10px] font-semibold text-emerald-300">Upload Complete</p>
-              <code className="ml-auto font-grotesk text-[9px] text-gray-600">Drone ID: {result.droneId || 'N/A'}</code>
-            </div>
-            {result.groundResults && (
-              <div className="grid grid-cols-1 gap-2 pt-1">
-                {result.groundResults.map((r, i) => (
-                  <div key={i} className="glass p-2 rounded-lg flex items-center justify-between">
-                    <p className="font-grotesk text-[10px] text-gray-400">{r.file}</p>
-                    {r.status === 'success' ? (
-                      <p className="font-jakarta text-[10px] text-emerald-400">
-                        {r.inference?.predicted_label || 'Unclassified'} ({((r.inference?.confidence || 0) * 100).toFixed(1)}%)
-                      </p>
-                    ) : (
-                      <p className="font-jakarta text-[10px] text-red-400">Error</p>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
           </motion.div>
         )}
       </AnimatePresence>
 
-      {/* ── SD Card Contingency Upload (visually distinct) ── */}
+      {/* ── Prediction Result Card ── */}
+      <AnimatePresence>
+        {result && (
+          <motion.div
+            variants={panelV} initial="hidden" animate="visible" exit={{ opacity: 0 }}
+            className="glass border border-emerald-500/30 p-4 rounded-xl space-y-4"
+            style={{ boxShadow: '0 0 28px rgba(52,211,153,0.12)' }}
+          >
+            {/* Prediction header */}
+            <div className="flex items-start gap-3">
+              <div className="w-9 h-9 rounded-xl bg-emerald-500/15 border border-emerald-500/25
+                flex items-center justify-center shrink-0">
+                <Leaf size={17} className="text-emerald-400" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="font-jakarta text-[9px] text-gray-500 uppercase tracking-widest mb-1">
+                  ResNet50 / MobileNetV3 Prediction
+                </p>
+                <p className="font-jakarta text-[15px] font-bold text-emerald-200 leading-tight capitalize truncate">
+                  {result.species_prediction ?? 'Unclassified'}
+                </p>
+              </div>
+              <div className="shrink-0 text-right">
+                <p className="font-grotesk text-2xl font-bold text-emerald-400">
+                  {((result.confidence_score ?? 0) * 100).toFixed(1)}
+                  <span className="text-[11px] text-gray-600 ml-0.5">%</span>
+                </p>
+                <p className="font-jakarta text-[8px] text-gray-600 uppercase tracking-widest">Confidence</p>
+              </div>
+            </div>
+
+            {/* Confidence bar */}
+            <div className="h-1.5 rounded-full bg-emerald-900/40 overflow-hidden">
+              <motion.div
+                initial={{ width: 0 }}
+                animate={{ width: `${((result.confidence_score ?? 0) * 100).toFixed(1)}%` }}
+                transition={{ duration: 0.8, ease: 'easeOut' }}
+                className="h-full rounded-full"
+                style={{ background: 'linear-gradient(90deg, #10B981, #34d399)' }}
+              />
+            </div>
+
+            {/* Meta row */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <CheckCircle2 size={10} className="text-emerald-400" />
+              <span className="font-jakarta text-[9px] text-emerald-400">Classification complete</span>
+              <span className="font-grotesk text-[9px] text-gray-700 ml-auto">
+                ID: {result.image_id} · {new Date(result.timestamp).toLocaleTimeString()}
+              </span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Micro-Climate Data Fusion Snapshot ── */}
+      <AnimatePresence>
+        {result && (
+          <motion.div
+            variants={panelV} initial="hidden" animate="visible" exit={{ opacity: 0 }}
+            className="glass p-4 rounded-xl space-y-3"
+            style={{ border: '1px solid rgba(56,189,248,0.2)' }}
+          >
+            <div className="flex items-center gap-2">
+              <FlaskConical size={12} className="text-sky-400" />
+              <p className="font-jakarta text-[9px] text-gray-500 uppercase tracking-widest">
+                Micro-Climate Data Fusion Snapshot
+              </p>
+              <span className="ml-auto font-grotesk text-[8px] text-sky-500">6-param + GPS</span>
+            </div>
+
+            {/* 6 sensor params */}
+            <div className="grid grid-cols-3 md:grid-cols-6 gap-2">
+              {ENV_PARAMS.map(({ key, label, unit, color, Icon }) => {
+                const raw = result.environmental_telemetry_snapshot?.[key];
+                const display = raw != null ? Number(raw).toFixed(key === 'light_lux' ? 0 : 1) : '—';
+                return (
+                  <div key={key} className="glass p-2 rounded-lg flex flex-col gap-1"
+                    style={{ borderColor: `${color}22`, border: `1px solid ${color}22` }}>
+                    <div className="flex items-center justify-between">
+                      <span className="font-jakarta text-[8px] text-gray-600 uppercase tracking-wide">{label}</span>
+                      <Icon size={9} style={{ color }} />
+                    </div>
+                    <p className="font-grotesk text-[13px] font-bold" style={{ color }}>
+                      {display}
+                      <span className="text-[8px] text-gray-700 ml-0.5">{unit}</span>
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* GPS coordinates */}
+            <div className="flex items-center gap-3 pt-1">
+              <MapPin size={10} className="text-emerald-500 shrink-0" />
+              <span className="font-jakarta text-[9px] text-gray-500 uppercase tracking-widest">Camera GPS</span>
+              {result.latitude != null && result.longitude != null ? (
+                <span className="font-grotesk text-[10px] text-emerald-300">
+                  {Number(result.latitude).toFixed(5)}, {Number(result.longitude).toFixed(5)}
+                </span>
+              ) : (
+                <span className="font-grotesk text-[10px] text-gray-700">No GPS fix captured</span>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── SD Card Contingency Upload ── */}
       <div className="pt-2">
         <SDCardDropZone />
       </div>
@@ -1027,9 +1099,9 @@ function Pill({ ok, label }) {
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 const TABS = [
-  { id: 'telemetry', label: 'Live Telemetry',         icon: Activity },
-  { id: 'sync',      label: 'Field Sync Hub',          icon: Database },
-  { id: 'media',     label: 'Field Media & Mapping',   icon: Camera },
+  { id: 'telemetry', label: 'Live Telemetry',     icon: Activity },
+  { id: 'sync',      label: 'Field Sync Hub',      icon: Database },
+  { id: 'media',     label: 'Ground Ingestion',    icon: Leaf },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -1233,7 +1305,7 @@ export default function App() {
               Environmental Biodiversity Dashboard
             </h1>
             <p className="font-grotesk text-[10px] text-gray-600">
-              UNIBEN Field Station · 6-Parameter Telemetry · Dual-View CV Pipeline · SD Card Contingency
+              UNIBEN Field Station · 6-Parameter Telemetry · Ground Species CV · Micro-Climate Fusion
             </p>
           </div>
           <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px]
@@ -1268,6 +1340,7 @@ export default function App() {
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.18 }}
             >
+            
               <TelemetryTab readings={readings} histories={histories} geoCoords={geoCoords} wsState={wsState} />
             </motion.div>
           )}
@@ -1284,7 +1357,11 @@ export default function App() {
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.18 }}
             >
-              <FieldMediaTab onSessionCreated={refreshAll} />
+              <FieldMediaTab
+                onSessionCreated={refreshAll}
+                geoCoords={geoCoords}
+                readings={readings}
+              />
             </motion.div>
           )}
         </AnimatePresence>
