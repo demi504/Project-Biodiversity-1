@@ -1,17 +1,26 @@
 /**
- * UNIBEN Biodiversity Pipeline — Premium React Dashboard v5
+ * UNIBEN Biodiversity Pipeline — Premium React Dashboard v6
  *
- * Tab 1 — Live Telemetry   : 6-param metric cards + sparklines + provenance toggle
- * Tab 2 — Field Sync Hub   : ENGAGE PIPELINE ENGINE + Excel download
- * Tab 3 — Ground Ingestion : Single-image species CV + Micro-Climate Data Fusion + SD Card
+ * Tab 1 — Live ESP32 Telemetry & Sensor Buffer
+ *   6-param metric cards + sparklines + provenance toggle + zone filter
+ * Tab 2 — Drone Aerial Canopy Mapping & Orthomosaic Tiles
+ *   Drone image upload · GPS zone auto-assignment · per-zone summary cards
+ *   Data Pipeline engine · Excel export
+ * Tab 3 — Ground-Level Biodiversity & Field Ingestion
+ *   Single-image species CV + Micro-Climate Data Fusion + SD Card contingency
  *
  * Six parameters streamed from ESP32 + browser geolocation:
  *   Temperature (°C) · Humidity (%) · Pressure (hPa) · Light (Lux) · Sound (dB) · Altitude (m)
  *
- * Domain 2: Manual Override tab completely removed.
+ * 3-Zone spatial segmentation (UNIBEN Ugbowo campus):
+ *   ZONE_A — Dense Canopy / Forested Sector
+ *   ZONE_B — Mixed Urban / Shrub Perimeter
+ *   ZONE_C — Open Ground / Bare Soil
+ *
+ * Domain 2: Dual-stream (drone + ground) pipeline fully restored.
  * Domain 3: navigator.geolocation auto-captured; WebSocket /ws/telemetry client integrated.
- * Domain 4: SD Card Contingency drop zone retained in Ground Ingestion tab.
- * Domain 5: Aerial/drone dual-view replaced with ground-only CV + telemetry fusion.
+ * Domain 4: SD Card Contingency drop zone in Drone Canopy tab.
+ * Domain 5: GPS geofencing auto-assigns focal zone on every upload.
  */
 
 import { useState, useEffect, useCallback, useRef, memo } from 'react';
@@ -29,6 +38,23 @@ import { ResponsiveContainer, LineChart, Line, Tooltip } from 'recharts';
 const API     = 'http://127.0.0.1:8000';
 const WS_URL  = 'ws://127.0.0.1:8000/ws/telemetry';
 const POLL_MS = 2500;
+
+/* ── Focal Zone definitions (mirrors backend FocalZone enum) ─────────────── */
+const FOCAL_ZONES = [
+  { id: 'ZONE_A', label: 'ZONE A — Dense Canopy / Forested Sector',  color: '#10B981', bg: 'bg-emerald-900/30', text: 'text-emerald-300', border: 'border-emerald-600/40' },
+  { id: 'ZONE_B', label: 'ZONE B — Mixed Urban / Shrub Perimeter',   color: '#F59E0B', bg: 'bg-amber-900/30',   text: 'text-amber-300',   border: 'border-amber-600/40'   },
+  { id: 'ZONE_C', label: 'ZONE C — Open Ground / Bare Soil',         color: '#EF4444', bg: 'bg-red-900/30',     text: 'text-red-300',     border: 'border-red-600/40'     },
+];
+
+function FocalZoneBadge({ zoneId }) {
+  const z = FOCAL_ZONES.find(f => f.id === zoneId) ?? { id: zoneId, label: zoneId, bg: 'bg-gray-800', text: 'text-gray-400', border: 'border-gray-700', color: '#6B7280' };
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[9px] font-jakarta font-semibold border ${z.bg} ${z.text} ${z.border}`}>
+      <span className="w-1.5 h-1.5 rounded-full" style={{ background: z.color }} />
+      {z.label}
+    </span>
+  );
+}
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  Framer-motion variants                                                     */
@@ -351,7 +377,296 @@ function AnalyticsPanel() {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab 2 — Field Telemetry Sync Hub (replaces Manual Override)               */
+/*  Tab 2 — Drone Aerial Canopy Mapping & Orthomosaic Tiles                   */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+function DroneCanopyTab({ onPipelineComplete, geoCoords }) {
+  const [droneFile,   setDroneFile]   = useState(null);
+  const [preview,     setPreview]     = useState(null);
+  const [campusZone,  setCampusZone]  = useState('ZONE_B');
+  const [uploading,   setUploading]   = useState(false);
+  const [result,      setResult]      = useState(null);
+  const [error,       setError]       = useState('');
+  const [zoneSummary, setZoneSummary] = useState({});
+  const [pipeRunning, setPipeRunning] = useState(false);
+  const [pipeResult,  setPipeResult]  = useState(null);
+  const [pipeError,   setPipeError]   = useState('');
+
+  /* fetch zone summaries */
+  const fetchZoneSummary = useCallback(async () => {
+    try {
+      const summaries = {};
+      await Promise.all(FOCAL_ZONES.map(async z => {
+        const r = await fetch(`${API}/api/v1/zones/${z.id}/summary`);
+        if (r.ok) summaries[z.id] = await r.json();
+      }));
+      setZoneSummary(summaries);
+    } catch {}
+  }, []);
+
+  useEffect(() => { fetchZoneSummary(); }, [fetchZoneSummary]);
+
+  const handleFile = useCallback(file => {
+    setDroneFile(file);
+    setPreview(URL.createObjectURL(file));
+    setResult(null);
+    setError('');
+  }, []);
+
+  const dd = useDragDrop(handleFile);
+
+  const submit = useCallback(async () => {
+    if (!droneFile) return;
+    setUploading(true);
+    setError('');
+    setResult(null);
+    try {
+      const fd = new FormData();
+      fd.append('drone_file', droneFile);
+      fd.append('campus_zone', campusZone);
+      if (geoCoords?.latitude)  fd.append('latitude',  geoCoords.latitude);
+      if (geoCoords?.longitude) fd.append('longitude', geoCoords.longitude);
+      const res = await fetch(`${API}/api/v1/upload-drone-patch`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
+      const data = await res.json();
+      setResult(data);
+      fetchZoneSummary();
+    } catch (err) { setError(err.message); }
+    finally { setUploading(false); }
+  }, [droneFile, campusZone, geoCoords, fetchZoneSummary]);
+
+  const engagePipeline = useCallback(async () => {
+    setPipeRunning(true);
+    setPipeError('');
+    setPipeResult(null);
+    try {
+      const res = await fetch(`${API}/api/v1/analytics/run-pipeline`, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
+      const data = await res.json();
+      setPipeResult(data);
+      onPipelineComplete?.();
+    } catch (err) { setPipeError(err.message); }
+    finally { setPipeRunning(false); }
+  }, [onPipelineComplete]);
+
+  return (
+    <motion.div variants={stagger} initial="hidden" animate="visible" className="space-y-4">
+
+      {/* Header */}
+      <motion.div variants={panelV} className="glass p-4 flex items-center gap-3">
+        <Layers size={16} className="text-sky-400 shrink-0" />
+        <div className="flex-1">
+          <p className="font-jakarta text-[11px] font-semibold text-sky-300">
+            🛸 Drone Aerial Canopy Mapping
+          </p>
+          <p className="font-grotesk text-[9px] text-gray-600 mt-0.5">
+            Upload orthomosaic tiles · GPS geofence → auto zone assignment · CV species inference
+          </p>
+        </div>
+        {geoCoords && (
+          <span className="font-grotesk text-[9px] text-emerald-400 bg-emerald-900/20 border border-emerald-700/30 px-2 py-0.5 rounded-full flex items-center gap-1">
+            <MapPin size={9} /> GPS Active
+          </span>
+        )}
+      </motion.div>
+
+      {/* Zone summary cards */}
+      <motion.div variants={panelV} className="grid grid-cols-3 gap-2">
+        {FOCAL_ZONES.map(z => {
+          const s = zoneSummary[z.id];
+          return (
+            <motion.div
+              key={z.id}
+              whileHover={{ scale: 1.03 }}
+              className={`glass p-3 rounded-xl border ${z.border} flex flex-col gap-1 cursor-pointer transition-all`}
+              onClick={() => setCampusZone(z.id)}
+              style={{ boxShadow: campusZone === z.id ? `0 0 18px ${z.color}33` : 'none' }}
+            >
+              <div className="flex items-center justify-between">
+                <span className={`font-jakarta text-[9px] font-bold uppercase tracking-widest ${z.text}`}>{z.id}</span>
+                {campusZone === z.id && <span className="w-1.5 h-1.5 rounded-full" style={{ background: z.color }} />}
+              </div>
+              <p className="font-grotesk text-[18px] font-bold" style={{ color: z.color }}>
+                {s?.total ?? '—'}
+              </p>
+              <p className="font-grotesk text-[8px] text-gray-600 leading-tight">
+                {z.label.split(' — ')[1]}
+              </p>
+              <div className="flex gap-2 mt-0.5">
+                {[['Drone', s?.drone_patches], ['Ground', s?.ground_uploads]].map(([lbl, val]) => (
+                  <span key={lbl} className="font-jakarta text-[7px] text-gray-700">{lbl}: {val ?? 0}</span>
+                ))}
+              </div>
+            </motion.div>
+          );
+        })}
+      </motion.div>
+
+      {/* Upload zone + zone selector */}
+      <motion.div variants={panelV} className="glass p-4 flex flex-col gap-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Layers size={12} className="text-sky-400" />
+          <p className="font-jakarta text-[10px] font-semibold text-sky-300">Upload Drone Orthomosaic</p>
+          <div className="ml-auto flex items-center gap-1.5">
+            <span className="font-jakarta text-[9px] text-gray-600">Zone:</span>
+            <select
+              value={campusZone}
+              onChange={e => setCampusZone(e.target.value)}
+              className="bg-[#0D1321] border border-emerald-800/40 text-emerald-300 text-[9px]
+                font-jakarta rounded-lg px-2 py-1 outline-none cursor-pointer"
+            >
+              {FOCAL_ZONES.map(z => (
+                <option key={z.id} value={z.id}>{z.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Drop zone */}
+        <div
+          ref={dd.ref}
+          onDragOver={dd.onDragOver} onDragLeave={dd.onDragLeave} onDrop={dd.onDrop}
+          onClick={() => dd.ref.current?.querySelector('input')?.click()}
+          className="relative rounded-xl border-2 border-dashed cursor-pointer
+            flex flex-col items-center justify-center gap-2 p-6 transition-all duration-300"
+          style={{
+            borderColor: dd.dragging ? '#38bdf8' : 'rgba(56,189,248,0.25)',
+            background:  dd.dragging ? 'rgba(56,189,248,0.07)' : 'transparent',
+            minHeight: preview ? 'auto' : 130,
+          }}
+        >
+          <input type="file" accept="image/*" className="hidden" onChange={dd.onInput} />
+          {preview ? (
+            <div className="w-full">
+              <img src={preview} alt="Drone frame" className="w-full rounded-lg object-contain max-h-48" />
+              <p className="font-grotesk text-[9px] text-gray-600 text-center mt-1 truncate">{droneFile?.name}</p>
+            </div>
+          ) : (
+            <>
+              <UploadCloud size={26} className="text-sky-400 opacity-50" />
+              <p className="font-jakarta text-[10px] text-gray-600 text-center">Drag &amp; drop drone frame or click</p>
+              <p className="font-grotesk text-[9px] text-gray-700 text-center">JPG · PNG · TIFF · WebP</p>
+            </>
+          )}
+        </div>
+
+        {droneFile && (
+          <motion.button
+            initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}
+            onClick={submit} disabled={uploading}
+            whileHover={{ scale: uploading ? 1 : 1.015, boxShadow: '0 0 30px rgba(56,189,248,0.3)' }}
+            whileTap={{ scale: 0.98 }}
+            className="w-full py-3 rounded-2xl font-jakarta font-bold text-[11px] tracking-wide
+              flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+            style={{
+              background: uploading
+                ? 'linear-gradient(135deg, #0c4a6e, #075985)'
+                : 'linear-gradient(135deg, #0ea5e9, #0284c7, #0369a1)',
+              boxShadow: uploading ? 'none' : '0 0 24px rgba(14,165,233,0.25)',
+            }}
+          >
+            {uploading
+              ? <><RefreshCw size={13} className="animate-spin" />Uploading &amp; Classifying…</>
+              : <><Camera size={13} />Upload Drone Frame</>}
+          </motion.button>
+        )}
+      </motion.div>
+
+      {/* Error */}
+      <AnimatePresence>
+        {error && (
+          <motion.div initial={{ opacity: 0, y: -6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+            className="glass border border-red-700/40 p-3 rounded-xl flex items-start gap-2">
+            <XCircle size={13} className="text-red-400 mt-0.5 shrink-0" />
+            <p className="font-grotesk text-[10px] text-red-300">{error}</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Result card */}
+      <AnimatePresence>
+        {result && (
+          <motion.div variants={panelV} initial="hidden" animate="visible" exit={{ opacity: 0 }}
+            className="glass border border-sky-700/30 p-4 rounded-xl space-y-3">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 size={13} className="text-sky-400 shrink-0" />
+              <p className="font-jakarta text-[10px] font-semibold text-sky-300">Drone Frame Ingested</p>
+              <FocalZoneBadge zoneId={result.focal_zone} />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                { label: 'Drone ID',   value: `#${result.drone_id}` },
+                { label: 'Zone',       value: result.zone_label },
+                { label: 'Prediction', value: result.inference?.predicted_label ?? '—' },
+                { label: 'Confidence', value: result.inference?.confidence != null ? `${(result.inference.confidence * 100).toFixed(1)}%` : '—' },
+              ].map(({ label, value }) => (
+                <div key={label} className="glass p-2 rounded-lg">
+                  <p className="font-jakarta text-[8px] text-gray-600 uppercase tracking-widest">{label}</p>
+                  <p className="font-grotesk text-[11px] text-sky-200 font-semibold truncate">{value}</p>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Data Pipeline Engine section ────────────────────────────────── */}
+      <motion.div variants={panelV} className="glass p-4 rounded-xl border border-emerald-900/30 space-y-3">
+        <div className="flex items-center gap-2">
+          <Database size={13} className="text-emerald-400" />
+          <p className="font-jakarta text-[10px] font-semibold text-emerald-300">Field Data Pipeline Engine</p>
+        </div>
+        <motion.button
+          id="engage-pipeline-btn"
+          onClick={engagePipeline} disabled={pipeRunning}
+          whileHover={{ scale: pipeRunning ? 1 : 1.015, boxShadow: '0 0 30px rgba(52,211,153,0.3)' }}
+          whileTap={{ scale: 0.98 }}
+          className="w-full py-3 rounded-2xl font-jakarta font-bold text-[11px] tracking-wide
+            flex items-center justify-center gap-2 transition-all disabled:opacity-50"
+          style={{
+            background: pipeRunning
+              ? 'linear-gradient(135deg, #064E3B, #065F46)'
+              : 'linear-gradient(135deg, #10B981, #059669, #047857)',
+            boxShadow: pipeRunning ? 'none' : '0 0 24px rgba(16,185,129,0.2)',
+          }}
+        >
+          {pipeRunning
+            ? <><RefreshCw size={13} className="animate-spin" />Running Pipeline…</>
+            : <><Zap size={13} />🔥 ENGAGE DATA SCIENTIST PIPELINE ENGINE</>}
+        </motion.button>
+        {pipeError && <p className="font-grotesk text-[10px] text-red-300">{pipeError}</p>}
+        {pipeResult && (
+          <div className="glass border border-emerald-600/20 p-2 rounded-xl flex items-center gap-2">
+            <CheckCircle2 size={11} className="text-emerald-400" />
+            <p className="font-jakarta text-[10px] text-emerald-300">
+              Pipeline complete · {pipeResult.anomaly_count} anomaly{pipeResult.anomaly_count !== 1 ? 's' : ''} detected
+            </p>
+            {pipeResult.excel_download_url && (
+              <a href={`${API}${pipeResult.excel_download_url}`} target="_blank" rel="noopener noreferrer"
+                className="ml-auto flex items-center gap-1 text-[9px] font-jakarta text-emerald-400
+                  border border-emerald-600/30 px-2 py-0.5 rounded-lg hover:bg-emerald-900/20">
+                <Download size={9} /> Excel
+              </a>
+            )}
+          </div>
+        )}
+        <a href={`${API}/api/v1/reports/export-excel?session_id=all`}
+          target="_blank" rel="noopener noreferrer"
+          className="flex items-center justify-center gap-2 w-full py-2 rounded-xl font-jakarta text-[10px]
+            border border-emerald-700/40 text-emerald-300 hover:bg-emerald-900/20 transition-colors">
+          <Download size={11} /> Download Full 4-Sheet Excel Workbook
+        </a>
+      </motion.div>
+
+      {/* ── SD Card drop zone ───────────────────────────────────────────── */}
+      <SDCardDropZone />
+
+    </motion.div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  (Legacy SDSyncTab retained as standalone component for direct use)         */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 function SDSyncTab({ onPipelineComplete }) {
@@ -1095,13 +1410,13 @@ function Pill({ ok, label }) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab bar — 3 tabs (Manual Override removed)                                */
+/*  Tab bar — 3 tabs: Telemetry · Drone Canopy · Ground Ingestion             */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 const TABS = [
-  { id: 'telemetry', label: 'Live Telemetry',     icon: Activity },
-  { id: 'sync',      label: 'Field Sync Hub',      icon: Database },
-  { id: 'media',     label: 'Ground Ingestion',    icon: Leaf },
+  { id: 'telemetry', label: 'Live ESP32 Telemetry & Sensor Buffer',       icon: Activity },
+  { id: 'drone',     label: 'Drone Aerial Canopy Mapping & Orthomosaic',  icon: Layers   },
+  { id: 'media',     label: 'Ground-Level Biodiversity & Field Ingestion',icon: Leaf     },
 ];
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -1305,7 +1620,7 @@ export default function App() {
               Environmental Biodiversity Dashboard
             </h1>
             <p className="font-grotesk text-[10px] text-gray-600">
-              UNIBEN Field Station · 6-Parameter Telemetry · Ground Species CV · Micro-Climate Fusion
+              UNIBEN Field Station · Dual-Stream Pipeline · Drone Canopy + Ground CV · 3-Zone Spatial Segmentation
             </p>
           </div>
           <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px]
@@ -1344,12 +1659,12 @@ export default function App() {
               <TelemetryTab readings={readings} histories={histories} geoCoords={geoCoords} wsState={wsState} />
             </motion.div>
           )}
-          {activeTab === 'sync' && (
-            <motion.div key="sync"
+          {activeTab === 'drone' && (
+            <motion.div key="drone"
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               transition={{ duration: 0.18 }}
             >
-              <SDSyncTab onPipelineComplete={refreshAll} />
+              <DroneCanopyTab onPipelineComplete={refreshAll} geoCoords={geoCoords} />
             </motion.div>
           )}
           {activeTab === 'media' && (

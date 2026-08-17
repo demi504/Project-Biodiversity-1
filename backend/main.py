@@ -38,6 +38,7 @@ import json as _json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from enum import Enum
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, status
@@ -71,6 +72,131 @@ ALLOWED_IMAGE_CONTENT_TYPES = {
 }
 
 LAST_ESP32_HEARTBEAT: float = 0.0
+
+# ---------------------------------------------------------------------------
+# Focal Zone definitions — 3-zone UNIBEN Ugbowo campus spatial segmentation
+# ---------------------------------------------------------------------------
+
+class FocalZone(str, Enum):
+    """Three ecological focal zones across UNIBEN Ugbowo campus."""
+    ZONE_A = "ZONE_A"   # Dense Canopy / Forested Sector
+    ZONE_B = "ZONE_B"   # Mixed Urban / Shrub Perimeter
+    ZONE_C = "ZONE_C"   # Open Ground / Bare Soil
+
+
+ZONE_LABELS: Dict[str, str] = {
+    FocalZone.ZONE_A: "Dense Canopy / Forested Sector",
+    FocalZone.ZONE_B: "Mixed Urban / Shrub Perimeter",
+    FocalZone.ZONE_C: "Open Ground / Bare Soil",
+}
+
+# GPS bounding boxes for UNIBEN Ugbowo campus (approx WGS84 decimal degrees).
+# Tune via environment or PR if surveyed coordinates are updated.
+ZONE_BOUNDS: Dict[str, Dict[str, float]] = {
+    FocalZone.ZONE_A: {"lat_min": 6.396, "lat_max": 6.402, "lon_min": 5.607, "lon_max": 5.615},
+    FocalZone.ZONE_B: {"lat_min": 6.390, "lat_max": 6.397, "lon_min": 5.600, "lon_max": 5.612},
+    FocalZone.ZONE_C: {"lat_min": 6.384, "lat_max": 6.392, "lon_min": 5.594, "lon_max": 5.607},
+}
+
+
+def assign_focal_zone(
+    lat: Optional[float],
+    lon: Optional[float],
+    default: str = FocalZone.ZONE_B,
+) -> str:
+    """
+    GPS geofencing — map a coordinate pair to the correct campus focal zone.
+
+    Uses simple axis-aligned bounding-box containment. Returns `default`
+    (ZONE_B) when coordinates are absent or fall outside all defined bounds.
+    Zone priority: ZONE_A > ZONE_C > ZONE_B (ZONE_B is the catch-all).
+    """
+    if lat is None or lon is None:
+        return default
+    for zone in (FocalZone.ZONE_A, FocalZone.ZONE_C, FocalZone.ZONE_B):
+        b = ZONE_BOUNDS[zone]
+        if b["lat_min"] <= lat <= b["lat_max"] and b["lon_min"] <= lon <= b["lon_max"]:
+            return zone
+    return default
+
+
+def sync_telemetry_to_timestamp(
+    target_ts: datetime,
+    conn: "sqlite3.Connection",
+    window_minutes: int = 5,
+) -> Dict[str, Any]:
+    """
+    Temporal synchronization — fetch the closest sensor_readings row within
+    ±`window_minutes` of `target_ts`. Returns a dict of 6 environmental params
+    or an empty dict if no matching reading is found.
+    """
+    window = window_minutes * 60
+    iso = to_iso(target_ts)
+    row = conn.execute(
+        """
+        SELECT temperature_c, humidity_percent, pressure_hPa,
+               light_lux, sound_db, altitude_m
+        FROM   sensor_readings
+        WHERE  ABS(CAST((julianday(observed_at) - julianday(?)) * 86400 AS INTEGER)) <= ?
+        ORDER  BY ABS(julianday(observed_at) - julianday(?))
+        LIMIT  1
+        """,
+        (iso, window, iso),
+    ).fetchone()
+    if row is None:
+        return {}
+    return {
+        "temperature_c":    row["temperature_c"],
+        "humidity_percent": row["humidity_percent"],
+        "pressure_hPa":     row["pressure_hPa"],
+        "light_lux":        row["light_lux"],
+        "sound_db":         row["sound_db"],
+        "altitude_m":       row["altitude_m"],
+    }
+
+
+def filter_sensor_outlier(reading: Dict[str, Any]) -> bool:
+    """
+    Automated data cleaning — return True if the reading passes all physical
+    range checks; False if it is an outlier to be dropped.
+
+    Thresholds are conservative physiological / atmospheric limits:
+      Temperature : -10 to 60 °C  (tropical field environment)
+      Humidity    :   0 to 100 %
+      Pressure    : 800 to 1100 hPa
+      Light       :   0 to 200 000 Lux (direct tropical sun ceiling)
+      Sound       :   0 to 140 dB (pain threshold)
+    """
+    try:
+        t = float(reading.get("temperature_c", 20))
+        h = float(reading.get("humidity_percent", 50))
+        p = float(reading.get("pressure_hPa", 1013))
+        l = float(reading.get("light_lux", 0))
+        s = float(reading.get("sound_db", 0))
+    except (TypeError, ValueError):
+        return False  # unparseable → drop
+
+    return (
+        -10.0  <= t <=  60.0
+        and   0.0  <= h <= 100.0
+        and 800.0  <= p <= 1100.0
+        and   0.0  <= l <= 200_000.0
+        and   0.0  <= s <= 140.0
+    )
+
+
+def validate_image_file(path: "Path") -> bool:
+    """
+    Automated cleaning — attempt to open the saved image with Pillow to detect
+    corrupt or truncated files. Returns False if the file is unreadable.
+    """
+    try:
+        from PIL import Image as _PIL_Image
+        with _PIL_Image.open(path) as img:
+            img.verify()   # raises on corruption
+        return True
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # Load .env for API keys (no external dependency required)
@@ -226,6 +352,31 @@ class RunPipelineResponse(BaseModel):
     excel_report_path:  Optional[str] = None
     excel_download_url: Optional[str] = None
     messages:           List[str] = []
+
+
+class GroundImageUploadResponse(BaseModel):
+    """Response from POST /api/v1/upload-ground-image — CV + telemetry fusion result."""
+    image_id:                        int
+    species_prediction:              str
+    confidence_score:                float
+    focal_zone:                      str
+    zone_label:                      str
+    timestamp:                       datetime
+    latitude:                        Optional[float] = None
+    longitude:                       Optional[float] = None
+    environmental_telemetry_snapshot: Dict[str, Any] = {}
+
+
+class DroneOrthomosaicResponse(BaseModel):
+    """Response from POST /api/v1/upload-drone-patch — aerial frame record."""
+    drone_id:         int
+    original_filename: str
+    stored_path:      str
+    focal_zone:       str
+    zone_label:       str
+    campus_zone:      str
+    flight_timestamp: str
+    inference:        Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +563,54 @@ def init_database() -> None:
             )
             """
         )
+
+        # ── image_classifications (was missing — bug fix) ─────────────────────────────────────────────
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS image_classifications (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                sensor_reading_id INTEGER,
+                original_filename TEXT NOT NULL,
+                stored_filename   TEXT NOT NULL,
+                stored_path       TEXT NOT NULL,
+                content_type      TEXT,
+                file_size_bytes   INTEGER NOT NULL DEFAULT 0,
+                model_name        TEXT NOT NULL DEFAULT 'mobilenet_v3_small',
+                predicted_label   TEXT,
+                confidence        REAL,
+                status            TEXT NOT NULL DEFAULT 'ok',
+                error_message     TEXT,
+                created_at        TEXT NOT NULL
+            )
+            """
+        )
+
+        # ── ground_image_uploads (new — single-image CV + telemetry fusion) ─
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ground_image_uploads (
+                image_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                stored_path       TEXT NOT NULL,
+                original_filename TEXT NOT NULL,
+                species_prediction TEXT,
+                confidence_score  REAL,
+                focal_zone        TEXT NOT NULL DEFAULT 'ZONE_B',
+                latitude          REAL,
+                longitude         REAL,
+                environmental_telemetry TEXT,
+                timestamp         TEXT NOT NULL
+            )
+            """
+        )
+
+        # ── Migrate: add focal_zone columns to existing tables ─────────────────
+        for tbl, col in [
+            ("drone_patches",    "focal_zone TEXT NOT NULL DEFAULT 'ZONE_B'"),
+            ("field_observations", "focal_zone TEXT"),
+        ]:
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
+            if "focal_zone" not in existing:
+                conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
 
         conn.commit()
 
@@ -1231,24 +1430,212 @@ def list_image_classifications(
 # Domain 4 (preserved) — Drone patch upload
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v1/upload-drone-patch")
+@app.post("/api/v1/upload-drone-patch", response_model=DroneOrthomosaicResponse)
 async def upload_drone_patch(
     drone_file:  UploadFile = File(...),
-    campus_zone: str        = Form("Zone 1"),
-) -> Dict[str, Any]:
-    """Accept aerial drone map frame, save with UUIDv4 filename, record patch."""
+    campus_zone: str        = Form("ZONE_B", description="Free-text zone label or focal zone ID."),
+    latitude:    Optional[float] = Form(None),
+    longitude:   Optional[float] = Form(None),
+) -> DroneOrthomosaicResponse:
+    """
+    Accept an aerial drone orthomosaic / map tile.
+
+    Pipeline:
+      1. Validate + save image file to disk (UUID filename).
+      2. Validate image integrity (Pillow — corrupt file guard).
+      3. Run local MobileNetV3 CV inference.
+      4. GPS geofence → auto-assign focal zone (ZONE_A/B/C).
+      5. Insert into drone_patches with campus_zone + focal_zone.
+      6. Return DroneOrthomosaicResponse.
+    """
     ext = validate_image_upload(drone_file)
-    _, stored_path, _ = save_upload_to_disk(drone_file, ext)
+    orig_name, stored_path, _ = save_upload_to_disk(drone_file, ext)
+
+    # Automated cleaning — reject corrupt / unreadable image files
+    if not validate_image_file(stored_path):
+        stored_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Image file is corrupt or unreadable. Upload aborted.",
+        )
+
+    # CV inference on the aerial frame
+    inference = _run_cv_inference(stored_path, drone_file.filename or "drone_frame")
+
+    # GPS geofencing → focal zone
+    focal_zone = assign_focal_zone(latitude, longitude)
+    zone_label = ZONE_LABELS.get(focal_zone, focal_zone)
+    flight_ts  = to_iso(utc_now())
 
     with get_connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO drone_patches (drone_image_path, campus_zone, flight_timestamp) VALUES (?, ?, ?)",
-            (str(stored_path), campus_zone, to_iso(utc_now())),
+            """
+            INSERT INTO drone_patches
+              (drone_image_path, campus_zone, focal_zone, flight_timestamp)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(stored_path), campus_zone, focal_zone, flight_ts),
         )
         drone_id = cursor.lastrowid
         conn.commit()
 
-    return {"status": "success", "drone_id": drone_id, "drone_image_path": str(stored_path)}
+    return DroneOrthomosaicResponse(
+        drone_id=drone_id,
+        original_filename=drone_file.filename or "unknown",
+        stored_path=str(stored_path),
+        focal_zone=focal_zone,
+        zone_label=zone_label,
+        campus_zone=campus_zone,
+        flight_timestamp=flight_ts,
+        inference=inference,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ground single-image upload — CV + telemetry fusion + GPS zone assignment
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/upload-ground-image", response_model=GroundImageUploadResponse)
+async def upload_ground_image(
+    file:      UploadFile       = File(...),
+    latitude:  Optional[float]  = Form(None),
+    longitude: Optional[float]  = Form(None),
+) -> GroundImageUploadResponse:
+    """
+    Ground-level single species image ingestion endpoint.
+
+    Pipeline:
+      1. Validate + save to disk (UUID filename).
+      2. Validate image integrity via Pillow.
+      3. Run MobileNetV3 CV inference → species_prediction + confidence.
+      4. GPS geofence → auto-assign focal zone (ZONE_A/B/C).
+      5. Temporal telemetry sync → fetch nearest sensor_reading within ±5 min.
+      6. Persist to ground_image_uploads table.
+      7. Return GroundImageUploadResponse (matches FieldMediaTab result schema).
+    """
+    ext = validate_image_upload(file)
+    orig_name, stored_path, _ = save_upload_to_disk(file, ext)
+
+    # Automated cleaning — reject corrupt files immediately
+    if not validate_image_file(stored_path):
+        stored_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Uploaded image is corrupt or truncated. Please re-capture and retry.",
+        )
+
+    # CV inference
+    inference = _run_cv_inference(stored_path, file.filename or "ground_image")
+    species   = inference.get("predicted_label", "Unclassified")
+    confidence = float(inference.get("confidence", 0.0))
+
+    # GPS geofencing
+    focal_zone = assign_focal_zone(latitude, longitude)
+    zone_label = ZONE_LABELS.get(focal_zone, focal_zone)
+    ts = utc_now()
+
+    # Temporal telemetry synchronization
+    telemetry_snapshot: Dict[str, Any] = {}
+    try:
+        with get_connection() as conn:
+            telemetry_snapshot = sync_telemetry_to_timestamp(ts, conn)
+    except Exception:
+        pass  # non-fatal — snapshot may be empty
+
+    # Persist
+    try:
+        with get_connection() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO ground_image_uploads
+                  (stored_path, original_filename, species_prediction,
+                   confidence_score, focal_zone, latitude, longitude,
+                   environmental_telemetry, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(stored_path),
+                    file.filename or "unknown",
+                    species,
+                    confidence,
+                    focal_zone,
+                    latitude,
+                    longitude,
+                    _json.dumps(telemetry_snapshot),
+                    to_iso(ts),
+                ),
+            )
+            image_id = cursor.lastrowid
+            conn.commit()
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Image saved but metadata could not be stored: {exc}",
+        ) from exc
+
+    return GroundImageUploadResponse(
+        image_id=image_id,
+        species_prediction=species,
+        confidence_score=confidence,
+        focal_zone=focal_zone,
+        zone_label=zone_label,
+        timestamp=ts,
+        latitude=latitude,
+        longitude=longitude,
+        environmental_telemetry_snapshot=telemetry_snapshot,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Zone information endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/zones")
+def list_zones() -> List[Dict[str, Any]]:
+    """Return all 3 focal zone definitions with labels and GPS bounding boxes."""
+    return [
+        {
+            "zone_id":   zone.value,
+            "label":     ZONE_LABELS[zone],
+            "bounds":    ZONE_BOUNDS[zone],
+        }
+        for zone in FocalZone
+    ]
+
+
+@app.get("/api/v1/zones/{zone_id}/summary")
+def zone_summary(zone_id: str) -> Dict[str, Any]:
+    """Per-zone observation counts across drone patches and ground images."""
+    zone_id = zone_id.upper()
+    if zone_id not in [z.value for z in FocalZone]:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown zone '{zone_id}'. Valid zones: ZONE_A, ZONE_B, ZONE_C.",
+        )
+    try:
+        with get_connection() as conn:
+            drone_count = conn.execute(
+                "SELECT COUNT(*) FROM drone_patches WHERE focal_zone = ?", (zone_id,)
+            ).fetchone()[0]
+            ground_count = conn.execute(
+                "SELECT COUNT(*) FROM ground_image_uploads WHERE focal_zone = ?", (zone_id,)
+            ).fetchone()[0]
+            obs_count = conn.execute(
+                "SELECT COUNT(*) FROM field_observations WHERE focal_zone = ?", (zone_id,)
+            ).fetchone()[0]
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database error: {exc}",
+        ) from exc
+    return {
+        "zone_id":            zone_id,
+        "label":              ZONE_LABELS.get(zone_id, zone_id),
+        "drone_patches":      drone_count,
+        "ground_uploads":     ground_count,
+        "field_observations": obs_count,
+        "total":              drone_count + ground_count + obs_count,
+    }
 
 
 # ---------------------------------------------------------------------------
