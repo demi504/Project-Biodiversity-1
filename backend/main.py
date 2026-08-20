@@ -3,19 +3,26 @@ Campus-scale biodiversity and environmental data pipeline API.
 
 Architecture: Local-first, offline-ready file-ingestion command center.
 Thesis: "Development of a campus-scale biodiversity and environmental data
-        pipeline using drone imagery and sensor integration for machine
+        pipeline using sensor integration and ground-level CV for machine
         learning application: A case study for UNIBEN Ugbowo campus."
 
-Domains implemented
--------------------
+Domains implemented — v7 Refactor (Dual Telemetry + Ground Photo AI)
+-------------------------------------------------------------------
   1. SQLite WAL mode + schema: sensor_readings (unique composite index),
-     external_weather_metadata, taxonomic_metadata.
-  2. Manual override backend completely removed.
-  3. WebSocket /ws/telemetry — merges ESP32 stream with browser geolocation.
-  4. POST /api/telemetry/upload-contingency — idempotent SD card CSV parser.
-  5. GET  /api/weather/field-day — OpenWeatherMap micro-climate baseline.
-     Background PlantNet taxonomy tagging on each ground image upload.
-  6. POST /api/v1/analytics/run-pipeline — unified data science engine.
+     ground_image_uploads (ExG index), external_weather_metadata.
+  2. WebSocket /ws/telemetry — live ESP32 8-parameter broadcast.
+  3. POST /api/telemetry/upload-csv — idempotent SD card CSV parser with
+     startup transient filtering and per-column statistical summary.
+  4. POST /api/ground-image/scan — MobileNetV3 CV inference + GPS geofencing
+     + Excess Green Index (ExG) + ±5 min temporal telemetry match.
+  5. GET  /api/ground-image/records — paginated fused multi-modal records.
+  6. GET  /api/weather/field-day — OpenWeatherMap micro-climate baseline.
+  7. POST /api/v1/analytics/run-pipeline — unified data science engine.
+
+Drone-specific endpoints REMOVED in v7:
+  - POST /api/v1/upload-drone-patch
+  - POST /drone-images  (legacy)
+  - GET  /image-classifications
 
 Run locally:
     uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -258,7 +265,7 @@ class SensorReadingResponse(BaseModel):
 
 
 class ImageClassificationResponse(BaseModel):
-    """Stored drone image metadata plus model inference result."""
+    """Stored CV image classification metadata plus model inference result."""
     id:                int
     sensor_reading_id: Optional[int]
     original_filename: str
@@ -275,7 +282,7 @@ class ImageClassificationResponse(BaseModel):
 
 
 class CVInferenceResponse(BaseModel):
-    """Computer-vision classification response for uploaded drone imagery."""
+    """Computer-vision classification response for uploaded field imagery."""
     status:          str
     predicted_label: str
     taxonomy:        Dict[str, str]
@@ -321,13 +328,14 @@ class TelemetryWSPayload(BaseModel):
 
 
 class SDCardUploadResponse(BaseModel):
-    """Result from parsing an ESP32 SD card CSV log dump."""
+    """Result from parsing an ESP32 SD card CSV log dump (POST /api/telemetry/upload-csv)."""
     status:        str
     filename:      str
     rows_parsed:   int
     rows_inserted: int
     rows_skipped:  int
     errors:        List[str]
+    stats:         Dict[str, Dict[str, float]] = {}  # per-column descriptive statistics
 
 
 class WeatherFieldDayResponse(BaseModel):
@@ -355,7 +363,7 @@ class RunPipelineResponse(BaseModel):
 
 
 class GroundImageUploadResponse(BaseModel):
-    """Response from POST /api/v1/upload-ground-image — CV + telemetry fusion result."""
+    """Response from POST /api/ground-image/scan — CV + ExG + telemetry fusion result."""
     image_id:                        int
     species_prediction:              str
     confidence_score:                float
@@ -365,18 +373,13 @@ class GroundImageUploadResponse(BaseModel):
     latitude:                        Optional[float] = None
     longitude:                       Optional[float] = None
     environmental_telemetry_snapshot: Dict[str, Any] = {}
+    excess_green_index:              Optional[float] = None  # ExG = (2G - R - B) / 255, normalised
+    taxonomy:                        Dict[str, str] = {}
 
 
-class DroneOrthomosaicResponse(BaseModel):
-    """Response from POST /api/v1/upload-drone-patch — aerial frame record."""
-    drone_id:         int
-    original_filename: str
-    stored_path:      str
-    focal_zone:       str
-    zone_label:       str
-    campus_zone:      str
-    flight_timestamp: str
-    inference:        Optional[Dict[str, Any]] = None
+# DroneOrthomosaicResponse removed in v7 — drone pipeline discontinued.
+# Drone endpoints (/api/v1/upload-drone-patch, /drone-images) are removed.
+# The drone_patches table is retained to preserve existing survey data.
 
 
 # ---------------------------------------------------------------------------
@@ -585,31 +588,34 @@ def init_database() -> None:
             """
         )
 
-        # ── ground_image_uploads (new — single-image CV + telemetry fusion) ─
+        # ── ground_image_uploads — single-image CV + ExG + telemetry fusion ─
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS ground_image_uploads (
-                image_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                stored_path       TEXT NOT NULL,
-                original_filename TEXT NOT NULL,
-                species_prediction TEXT,
-                confidence_score  REAL,
-                focal_zone        TEXT NOT NULL DEFAULT 'ZONE_B',
-                latitude          REAL,
-                longitude         REAL,
+                image_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                stored_path         TEXT NOT NULL,
+                original_filename   TEXT NOT NULL,
+                species_prediction  TEXT,
+                confidence_score    REAL,
+                focal_zone          TEXT NOT NULL DEFAULT 'ZONE_B',
+                latitude            REAL,
+                longitude           REAL,
                 environmental_telemetry TEXT,
-                timestamp         TEXT NOT NULL
+                excess_green_index  REAL,
+                timestamp           TEXT NOT NULL
             )
             """
         )
 
-        # ── Migrate: add focal_zone columns to existing tables ─────────────────
+        # ── Migrate: add new columns to existing tables ────────────────────────
         for tbl, col in [
-            ("drone_patches",    "focal_zone TEXT NOT NULL DEFAULT 'ZONE_B'"),
-            ("field_observations", "focal_zone TEXT"),
+            ("drone_patches",       "focal_zone TEXT NOT NULL DEFAULT 'ZONE_B'"),
+            ("field_observations",  "focal_zone TEXT"),
+            ("ground_image_uploads", "excess_green_index REAL"),
         ]:
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()}
-            if "focal_zone" not in existing:
+            col_name = col.split()[0]
+            if col_name not in existing:
                 conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
 
         conn.commit()
@@ -881,11 +887,12 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="UNIBEN Campus Biodiversity Data Pipeline",
     description=(
-        "Local-first API for 8-parameter environmental sensor data, "
-        "drone image CV inference, taxonomic classification, and "
-        "SD card contingency data ingestion."
+        "Local-first API for dual telemetry ingestion (Live ESP32 WebSocket + "
+        "Offline MicroSD CSV) and ground photography AI pipeline. "
+        "MobileNetV3 CV inference with Excess Green Index (ExG) calculation "
+        "and ±5 min temporal telemetry fusion."
     ),
-    version="3.0.0",
+    version="7.0.0",
     lifespan=lifespan,
 )
 
@@ -1293,7 +1300,7 @@ def upload_image_cv(
     file:              UploadFile      = File(...),
     sensor_reading_id: Optional[int]  = Form(None),
 ) -> CVInferenceResponse:
-    """Accept a drone/field image, persist locally, run CV inference."""
+    """Accept a field/ground image, persist locally, run CV inference."""
     if sensor_reading_id is not None:
         ensure_sensor_exists(sensor_reading_id)
 
@@ -1343,175 +1350,91 @@ def upload_image_cv(
     )
 
 
-@app.post(
-    "/drone-images",
-    response_model=ImageClassificationResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def upload_drone_image(
-    file:              UploadFile     = File(...),
-    sensor_reading_id: Optional[int] = Form(None),
-) -> ImageClassificationResponse:
-    """Legacy drone image endpoint — preserved for backward compat."""
-    if sensor_reading_id is not None:
-        ensure_sensor_exists(sensor_reading_id)
-
-    extension                              = validate_image_upload(file)
-    stored_filename, stored_path, filesize = save_upload_to_disk(file, extension)
-    inference                              = model_manager.infer(stored_path)
-    created_at                             = utc_now()
-
-    try:
-        with get_connection() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO image_classifications (
-                    sensor_reading_id, original_filename, stored_filename,
-                    stored_path, content_type, file_size_bytes,
-                    model_name, predicted_label, confidence,
-                    status, error_message, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    sensor_reading_id,
-                    file.filename or "unknown",
-                    stored_filename,
-                    str(stored_path),
-                    file.content_type,
-                    filesize,
-                    inference["model_name"],
-                    inference["predicted_label"],
-                    inference["confidence"],
-                    inference["status"],
-                    inference["error_message"],
-                    to_iso(created_at),
-                ),
-            )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM image_classifications WHERE id = ?",
-                (cursor.lastrowid,),
-            ).fetchone()
-    except sqlite3.Error as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Image was saved, but classification metadata could not be stored: {exc}",
-        ) from exc
-
-    if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Image metadata was inserted but could not be reloaded.",
-        )
-    return image_row_to_response(row)
-
-
-@app.get("/image-classifications", response_model=List[ImageClassificationResponse])
-def list_image_classifications(
-    limit:  int = Query(100, ge=1, le=1000),
-    offset: int = Query(0,   ge=0),
-) -> List[ImageClassificationResponse]:
-    """Return recent drone image classifications for dashboard display."""
-    try:
-        with get_connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM image_classifications ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-    except sqlite3.Error as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Unable to read image classifications: {exc}",
-        ) from exc
-    return [image_row_to_response(row) for row in rows]
+# ---------------------------------------------------------------------------
+# Drone endpoints REMOVED in v7 refactor
+# ---------------------------------------------------------------------------
+# POST /drone-images            — legacy drone image endpoint (removed)
+# GET  /image-classifications   — drone classification list (removed)
+# POST /api/v1/upload-drone-patch — orthomosaic upload (removed)
+#
+# The drone_patches SQLite table is retained to preserve existing survey data.
+# To re-enable drone ingestion, restore from git history (pre-v7 tag).
 
 
 # ---------------------------------------------------------------------------
-# Domain 4 (preserved) — Drone patch upload
+# Ground single-image scan — CV + ExG + telemetry fusion + GPS zone assignment
 # ---------------------------------------------------------------------------
 
-@app.post("/api/v1/upload-drone-patch", response_model=DroneOrthomosaicResponse)
-async def upload_drone_patch(
-    drone_file:  UploadFile = File(...),
-    campus_zone: str        = Form("ZONE_B", description="Free-text zone label or focal zone ID."),
-    latitude:    Optional[float] = Form(None),
-    longitude:   Optional[float] = Form(None),
-) -> DroneOrthomosaicResponse:
+def _compute_exg(image_path: Path) -> Optional[float]:
     """
-    Accept an aerial drone orthomosaic / map tile.
+    Compute the Excess Green Index (ExG) for a ground photograph.
 
-    Pipeline:
-      1. Validate + save image file to disk (UUID filename).
-      2. Validate image integrity (Pillow — corrupt file guard).
-      3. Run local MobileNetV3 CV inference.
-      4. GPS geofence → auto-assign focal zone (ZONE_A/B/C).
-      5. Insert into drone_patches with campus_zone + focal_zone.
-      6. Return DroneOrthomosaicResponse.
+    ExG = (2·G − R − B) / 255   (normalised to range −1 → +1)
+
+    Positive ExG → vegetation-dominated frame.
+    Negative ExG → bare soil / urban surface.
+
+    Mean R/G/B channel values are sampled from the full image after
+    converting to RGB.  Returns None if Pillow is unavailable or the
+    file cannot be opened.
     """
-    ext = validate_image_upload(drone_file)
-    orig_name, stored_path, _ = save_upload_to_disk(drone_file, ext)
-
-    # Automated cleaning — reject corrupt / unreadable image files
-    if not validate_image_file(stored_path):
-        stored_path.unlink(missing_ok=True)
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Image file is corrupt or unreadable. Upload aborted.",
-        )
-
-    # CV inference on the aerial frame
-    inference = _run_cv_inference(stored_path, drone_file.filename or "drone_frame")
-
-    # GPS geofencing → focal zone
-    focal_zone = assign_focal_zone(latitude, longitude)
-    zone_label = ZONE_LABELS.get(focal_zone, focal_zone)
-    flight_ts  = to_iso(utc_now())
-
-    with get_connection() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO drone_patches
-              (drone_image_path, campus_zone, focal_zone, flight_timestamp)
-            VALUES (?, ?, ?, ?)
-            """,
-            (str(stored_path), campus_zone, focal_zone, flight_ts),
-        )
-        drone_id = cursor.lastrowid
-        conn.commit()
-
-    return DroneOrthomosaicResponse(
-        drone_id=drone_id,
-        original_filename=drone_file.filename or "unknown",
-        stored_path=str(stored_path),
-        focal_zone=focal_zone,
-        zone_label=zone_label,
-        campus_zone=campus_zone,
-        flight_timestamp=flight_ts,
-        inference=inference,
-    )
+    try:
+        import numpy as _np
+        from PIL import Image as _PILImg
+        with _PILImg.open(image_path) as img:
+            rgb = img.convert("RGB")
+            arr = _np.array(rgb, dtype=_np.float32)
+        mean_r, mean_g, mean_b = arr[:, :, 0].mean(), arr[:, :, 1].mean(), arr[:, :, 2].mean()
+        exg = (2.0 * mean_g - mean_r - mean_b) / 255.0
+        return round(float(exg), 6)
+    except ImportError:
+        # numpy not installed — fallback with PIL only
+        try:
+            from PIL import Image as _PILImg
+            with _PILImg.open(image_path) as img:
+                rgb = img.convert("RGB")
+            stat = rgb.getextrema()  # type: ignore[attr-defined]
+            # rough channel mean via histogram
+            totals = [0.0, 0.0, 0.0]
+            counts = [0,   0,   0  ]
+            for band_idx, band in enumerate(rgb.split()):
+                hist = band.histogram()
+                total = sum(i * c for i, c in enumerate(hist))
+                count = sum(hist)
+                totals[band_idx] = total
+                counts[band_idx] = count
+            if all(c > 0 for c in counts):
+                mr = totals[0] / counts[0]
+                mg = totals[1] / counts[1]
+                mb = totals[2] / counts[2]
+                return round((2.0 * mg - mr - mb) / 255.0, 6)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Ground single-image upload — CV + telemetry fusion + GPS zone assignment
-# ---------------------------------------------------------------------------
-
-@app.post("/api/v1/upload-ground-image", response_model=GroundImageUploadResponse)
-async def upload_ground_image(
-    file:      UploadFile       = File(...),
-    latitude:  Optional[float]  = Form(None),
-    longitude: Optional[float]  = Form(None),
+@app.post("/api/ground-image/scan", response_model=GroundImageUploadResponse)
+async def ground_image_scan(
+    file:       UploadFile       = File(...),
+    latitude:   Optional[float]  = Form(None),
+    longitude:  Optional[float]  = Form(None),
+    focal_zone: Optional[str]    = Form(None, description="Manual zone override: ZONE_A, ZONE_B, or ZONE_C."),
 ) -> GroundImageUploadResponse:
     """
-    Ground-level single species image ingestion endpoint.
+    Ground-level field photo AI ingestion endpoint.
 
     Pipeline:
       1. Validate + save to disk (UUID filename).
       2. Validate image integrity via Pillow.
-      3. Run MobileNetV3 CV inference → species_prediction + confidence.
-      4. GPS geofence → auto-assign focal zone (ZONE_A/B/C).
-      5. Temporal telemetry sync → fetch nearest sensor_reading within ±5 min.
-      6. Persist to ground_image_uploads table.
-      7. Return GroundImageUploadResponse (matches FieldMediaTab result schema).
+      3. Run MobileNetV3 CV inference → species_prediction + confidence + taxonomy.
+      4. Compute Excess Green Index (ExG = (2G − R − B) / 255) via PIL/NumPy.
+      5. GPS geofence → auto-assign focal zone (ZONE_A/B/C).
+         If `focal_zone` form field supplied, it overrides GPS geofencing.
+      6. Temporal telemetry sync → fetch nearest sensor_reading within ±5 min.
+      7. Persist to ground_image_uploads table (including ExG).
+      8. Return GroundImageUploadResponse with taxonomy + ExG + telemetry snapshot.
     """
     ext = validate_image_upload(file)
     orig_name, stored_path, _ = save_upload_to_disk(file, ext)
@@ -1525,13 +1448,20 @@ async def upload_ground_image(
         )
 
     # CV inference
-    inference = _run_cv_inference(stored_path, file.filename or "ground_image")
-    species   = inference.get("predicted_label", "Unclassified")
+    inference  = _run_cv_inference(stored_path, file.filename or "ground_image")
+    species    = inference.get("predicted_label", "Unclassified")
     confidence = float(inference.get("confidence", 0.0))
+    taxonomy   = inference.get("taxonomy", {})
 
-    # GPS geofencing
-    focal_zone = assign_focal_zone(latitude, longitude)
-    zone_label = ZONE_LABELS.get(focal_zone, focal_zone)
+    # Excess Green Index
+    exg = _compute_exg(stored_path)
+
+    # GPS geofencing — manual override takes precedence
+    if focal_zone and focal_zone.upper() in (z.value for z in FocalZone):
+        resolved_zone = focal_zone.upper()
+    else:
+        resolved_zone = assign_focal_zone(latitude, longitude)
+    zone_label = ZONE_LABELS.get(resolved_zone, resolved_zone)
     ts = utc_now()
 
     # Temporal telemetry synchronization
@@ -1550,18 +1480,19 @@ async def upload_ground_image(
                 INSERT INTO ground_image_uploads
                   (stored_path, original_filename, species_prediction,
                    confidence_score, focal_zone, latitude, longitude,
-                   environmental_telemetry, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   environmental_telemetry, excess_green_index, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(stored_path),
                     file.filename or "unknown",
                     species,
                     confidence,
-                    focal_zone,
+                    resolved_zone,
                     latitude,
                     longitude,
                     _json.dumps(telemetry_snapshot),
+                    exg,
                     to_iso(ts),
                 ),
             )
@@ -1577,13 +1508,67 @@ async def upload_ground_image(
         image_id=image_id,
         species_prediction=species,
         confidence_score=confidence,
-        focal_zone=focal_zone,
+        focal_zone=resolved_zone,
         zone_label=zone_label,
         timestamp=ts,
         latitude=latitude,
         longitude=longitude,
         environmental_telemetry_snapshot=telemetry_snapshot,
+        excess_green_index=exg,
+        taxonomy=taxonomy,
     )
+
+
+# ---------------------------------------------------------------------------
+# Ground image records — paginated fused multi-modal history
+# ---------------------------------------------------------------------------
+
+@app.get("/api/ground-image/records")
+def list_ground_image_records(
+    limit:  int = Query(100, ge=1, le=1000),
+    offset: int = Query(0,   ge=0),
+    zone:   Optional[str] = Query(None, description="Filter by focal_zone (ZONE_A, ZONE_B, ZONE_C)."),
+) -> List[Dict[str, Any]]:
+    """
+    Return paginated ground image records with fused telemetry JSON for the
+    Fused Multi-Modal Records dashboard tab.
+
+    Each record includes: image_id, timestamp, focal_zone, species_prediction,
+    confidence_score, excess_green_index, environmental_telemetry (raw JSON string).
+    """
+    try:
+        with get_connection() as conn:
+            if zone and zone.upper() in (z.value for z in FocalZone):
+                rows = conn.execute(
+                    """
+                    SELECT image_id, timestamp, focal_zone, original_filename,
+                           species_prediction, confidence_score, excess_green_index,
+                           latitude, longitude, environmental_telemetry
+                    FROM   ground_image_uploads
+                    WHERE  focal_zone = ?
+                    ORDER  BY timestamp DESC, image_id DESC
+                    LIMIT  ? OFFSET ?
+                    """,
+                    (zone.upper(), limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT image_id, timestamp, focal_zone, original_filename,
+                           species_prediction, confidence_score, excess_green_index,
+                           latitude, longitude, environmental_telemetry
+                    FROM   ground_image_uploads
+                    ORDER  BY timestamp DESC, image_id DESC
+                    LIMIT  ? OFFSET ?
+                    """,
+                    (limit, offset),
+                ).fetchall()
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Unable to read ground image records: {exc}",
+        ) from exc
+    return [dict(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1605,7 +1590,7 @@ def list_zones() -> List[Dict[str, Any]]:
 
 @app.get("/api/v1/zones/{zone_id}/summary")
 def zone_summary(zone_id: str) -> Dict[str, Any]:
-    """Per-zone observation counts across drone patches and ground images."""
+    """Per-zone observation counts across ground image scans and field observations."""
     zone_id = zone_id.upper()
     if zone_id not in [z.value for z in FocalZone]:
         raise HTTPException(
@@ -1614,14 +1599,15 @@ def zone_summary(zone_id: str) -> Dict[str, Any]:
         )
     try:
         with get_connection() as conn:
-            drone_count = conn.execute(
-                "SELECT COUNT(*) FROM drone_patches WHERE focal_zone = ?", (zone_id,)
-            ).fetchone()[0]
             ground_count = conn.execute(
                 "SELECT COUNT(*) FROM ground_image_uploads WHERE focal_zone = ?", (zone_id,)
             ).fetchone()[0]
             obs_count = conn.execute(
                 "SELECT COUNT(*) FROM field_observations WHERE focal_zone = ?", (zone_id,)
+            ).fetchone()[0]
+            # drone_patches retained for historical data — no new records added post-v7
+            drone_count = conn.execute(
+                "SELECT COUNT(*) FROM drone_patches WHERE focal_zone = ?", (zone_id,)
             ).fetchone()[0]
     except sqlite3.Error as exc:
         raise HTTPException(
@@ -1629,12 +1615,12 @@ def zone_summary(zone_id: str) -> Dict[str, Any]:
             detail=f"Database error: {exc}",
         ) from exc
     return {
-        "zone_id":            zone_id,
-        "label":              ZONE_LABELS.get(zone_id, zone_id),
-        "drone_patches":      drone_count,
-        "ground_uploads":     ground_count,
-        "field_observations": obs_count,
-        "total":              drone_count + ground_count + obs_count,
+        "zone_id":                zone_id,
+        "label":                  ZONE_LABELS.get(zone_id, zone_id),
+        "ground_image_scans":     ground_count,
+        "field_observations":     obs_count,
+        "drone_patches_archived": drone_count,  # legacy — no new records post-v7
+        "total":                  ground_count + obs_count,
     }
 
 
@@ -1716,8 +1702,8 @@ async def upload_ground_batch(
 # Domain 4 — SD Card contingency upload (idempotent CSV parser)
 # ---------------------------------------------------------------------------
 
-@app.post("/api/telemetry/upload-contingency", response_model=SDCardUploadResponse)
-async def upload_sd_card_log(
+@app.post("/api/telemetry/upload-csv", response_model=SDCardUploadResponse)
+async def upload_csv_log(
     file: UploadFile = File(...),
 ) -> SDCardUploadResponse:
     """
@@ -1727,6 +1713,9 @@ async def upload_sd_card_log(
     are silently skipped via INSERT OR IGNORE against the unique composite index.
 
     Fault-value sanitization: nan, null, -999, -999.0, -999.00, inf, empty → NULL.
+
+    Startup transient filtering: rows where temperature_c, humidity_percent, AND
+    pressure_hPa are ALL exactly 0.0 are dropped as hardware boot artefacts.
 
     CSV expected columns (case-insensitive, flexible order):
       timestamp (or observed_at or time),
@@ -1738,6 +1727,9 @@ async def upload_sd_card_log(
       altitude (or altitude_m),
       latitude (or lat),
       longitude (or lon or lng)
+
+    Response includes `stats` — per-column descriptive statistics computed
+    from successfully parsed and inserted rows.
     """
     fname = file.filename or "sd_log.csv"
     allowed_ext = {".csv", ".txt"}
@@ -1774,6 +1766,7 @@ async def upload_sd_card_log(
     rows_parsed = rows_inserted = rows_skipped = 0
     errors: List[str] = []
     received_at = to_iso(utc_now())
+    _stat_accum: Dict[str, List[float]] = {}
 
     with get_connection() as conn:
         for row_num, row in enumerate(reader, start=2):
@@ -1805,6 +1798,12 @@ async def upload_sd_card_log(
                 lat      = _sanitize_float(_col(row, "latitude",         "lat")                     or "")
                 lon      = _sanitize_float(_col(row, "longitude",        "lon", "lng")              or "")
 
+                # Startup transient filter — drop all-zero boot frames
+                if temp == 0.0 and humidity == 0.0 and (pressure == 0.0 or pressure is None):
+                    errors.append(f"Row {row_num}: startup transient (all-zero frame) — skipped.")
+                    rows_skipped += 1
+                    continue
+
                 # At minimum we need temperature to be a real value
                 if temp is None:
                     errors.append(f"Row {row_num}: temperature fault value — stored as NULL.")
@@ -1833,11 +1832,22 @@ async def upload_sd_card_log(
                         to_iso(observed_at),
                         received_at,
                         None,
-                        "ESP32_SD_CARD",
+                        "ESP32_CSV",
                     ),
                 )
                 if cur.rowcount == 1:
                     rows_inserted += 1
+                    # Accumulate values for statistics
+                    for key, val in [
+                        ("temperature_c",    temp),
+                        ("humidity_percent", humidity),
+                        ("pressure_hPa",     pressure),
+                        ("light_lux",        light),
+                        ("sound_db",         sound),
+                        ("altitude_m",       altitude),
+                    ]:
+                        if val is not None:
+                            _stat_accum.setdefault(key, []).append(val)
                 else:
                     rows_skipped += 1
 
@@ -1847,6 +1857,23 @@ async def upload_sd_card_log(
 
         conn.commit()
 
+    # Compute per-column descriptive statistics from inserted rows
+    stats: Dict[str, Dict[str, float]] = {}
+    for col_key, values in _stat_accum.items():
+        if values:
+            n   = len(values)
+            s   = sum(values)
+            s2  = sum(v * v for v in values)
+            mean = s / n
+            variance = max(0.0, (s2 / n) - (mean ** 2))
+            stats[col_key] = {
+                "min":   round(min(values), 4),
+                "max":   round(max(values), 4),
+                "mean":  round(mean, 4),
+                "std":   round(variance ** 0.5, 4),
+                "count": n,
+            }
+
     return SDCardUploadResponse(
         status="ok",
         filename=fname,
@@ -1854,6 +1881,7 @@ async def upload_sd_card_log(
         rows_inserted=rows_inserted,
         rows_skipped=rows_skipped,
         errors=errors[:50],  # cap error list to avoid huge responses
+        stats=stats,
     )
 
 
