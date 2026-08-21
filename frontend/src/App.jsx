@@ -3,14 +3,14 @@
  *
  * Dual Telemetry Ingestion + Ground Photography AI Pipeline
  *
- * Tab 1 — Sensor Telemetry
+ * Tab 1 — Live ESP32 Telemetry & Sensor Buffer
  *   Toggle: Live WebSocket Stream (/ws/telemetry) | Offline MicroSD CSV Ingestion (/api/telemetry/upload-csv)
  *   Live mode: 6-gauge metric cards + sparklines + telemetry history table
  *   CSV mode: drag-and-drop field log, statistical summary, ingested records table
  *
- * Tab 2 — Ground Field Photo AI Ingestion
- *   Upload JPG/PNG · select focal zone · POST /api/ground-image/scan
- *   Returns: taxa/vegetation class · confidence · Excess Green Index (ExG) · ±5 min telemetry match
+ * Tab 2 — Ground-Level Biodiversity & Field Ingestion
+ *   Upload JPG/PNG · select focal zone · POST /api/classify  (alias: /api/species/classify)
+ *   Returns: taxa/vegetation class · confidence · Excess Green Index (ExG) · paired microclimate telemetry
  *
  * Tab 3 — Fused Multi-Modal Records
  *   GET /api/ground-image/records — historical ground + telemetry fusion table
@@ -58,9 +58,9 @@ const stagger = { visible: { transition: { staggerChildren: 0.06 } } };
 
 /* ── Tab definitions ────────────────────────────────────────────────────── */
 const TABS = [
-  { id: 'telemetry', label: 'Sensor Telemetry',            icon: Activity  },
-  { id: 'ground',    label: 'Ground Field Photo AI',        icon: Camera    },
-  { id: 'fused',     label: 'Fused Multi-Modal Records',    icon: Database  },
+  { id: 'telemetry', label: 'Live ESP32 Telemetry & Sensor Buffer',       icon: Activity  },
+  { id: 'ground',    label: 'Ground-Level Biodiversity & Field Ingestion', icon: Camera    },
+  { id: 'fused',     label: 'Fused Multi-Modal Records',                   icon: Database  },
 ];
 
 /* ── Metric definitions — 6 parameters ─────────────────────────────────── */
@@ -627,10 +627,22 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
     try {
       const fd = new FormData();
       fd.append('file', groundFile);
-      fd.append('focal_zone', zone);
+      fd.append('zone', zone);           // /api/classify uses `zone`
+      fd.append('focal_zone', zone);     // /api/ground-image/scan uses `focal_zone`
       if (geoCoords?.latitude  != null) fd.append('latitude',  geoCoords.latitude);
       if (geoCoords?.longitude != null) fd.append('longitude', geoCoords.longitude);
-      const res = await fetch(`${API}/api/ground-image/scan`, { method: 'POST', body: fd });
+
+      // Primary: POST /api/classify — fixes the previous 404
+      let res = await fetch(`${API}/api/classify`, { method: 'POST', body: fd });
+      if (res.status === 404 || res.status === 405) {
+        // Fallback: legacy endpoint
+        const fd2 = new FormData();
+        fd2.append('file', groundFile);
+        fd2.append('focal_zone', zone);
+        if (geoCoords?.latitude  != null) fd2.append('latitude',  geoCoords.latitude);
+        if (geoCoords?.longitude != null) fd2.append('longitude', geoCoords.longitude);
+        res = await fetch(`${API}/api/ground-image/scan`, { method: 'POST', body: fd2 });
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status} — ${await res.text()}`);
       const data = await res.json();
       setResult(data);
@@ -728,7 +740,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
             >
               {scanning
                 ? <><RefreshCw size={14} className="animate-spin" />Running AI Pipeline…</>
-                : <><ScanSearch size={14} />Classify &amp; Fuse Telemetry</>}
+                : <><ScanSearch size={14} />Classify Species</>}
             </motion.button>
             {!scanning && (
               <button onClick={reset}
@@ -757,81 +769,102 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
 
       {/* Classification result */}
       <AnimatePresence>
-        {result && (
-          <motion.div variants={stagger} initial="hidden" animate="visible" exit={{ opacity: 0 }} className="space-y-3">
+        {result && (() => {
+          // Normalise: support /api/classify schema AND legacy /api/ground-image/scan schema
+          const taxaName   = result.predicted_class   ?? result.species_prediction ?? '—';
+          const confScore  = result.confidence        ?? result.confidence_score   ?? null;
+          const exgVal     = result.exg_index         ?? result.excess_green_index ?? null;
+          const focalZone  = result.focal_zone        ?? zone;
+          const zoneLabel  = result.zone_label        ?? focalZone;
+          const taxonomy   = result.taxonomy          ?? {};
+          // Paired telemetry — try new schema first, then legacy
+          const pt = result.paired_telemetry ?? {};
+          const snap = result.environmental_telemetry_snapshot ?? {};
+          const PAIRED_PARAMS = [
+            { key: 'temperature', snapKey: 'temperature_c',    label: 'Temp',        unit: '°C',   color: '#f97316', Icon: Thermometer },
+            { key: 'humidity',    snapKey: 'humidity_percent', label: 'Humidity',    unit: '%',    color: '#38bdf8', Icon: Droplets    },
+            { key: 'pressure',   snapKey: 'pressure_hPa',     label: 'Pressure',    unit: ' hPa', color: '#a78bfa', Icon: Gauge       },
+            { key: 'light',      snapKey: 'light_lux',        label: 'Illuminance', unit: ' Lux', color: '#fbbf24', Icon: Sun         },
+            { key: 'sound',      snapKey: 'sound_db',         label: 'Sound',       unit: ' dB',  color: '#34d399', Icon: Volume2     },
+            { key: 'altitude',   snapKey: 'altitude_m',       label: 'Altitude',    unit: ' m',   color: '#2dd4bf', Icon: Mountain    },
+          ];
+          const hasTelemetry = PAIRED_PARAMS.some(p => pt[p.key] != null || snap[p.snapKey] != null);
 
-            {/* Main result card */}
-            <motion.div variants={panelV} className="glass border border-emerald-700/30 p-4 rounded-xl space-y-3">
-              <div className="flex items-center gap-2 flex-wrap">
-                <CheckCircle2 size={13} className="text-emerald-400 shrink-0" />
-                <p className="font-jakarta text-[11px] font-semibold text-emerald-300">AI Classification Complete</p>
-                <FocalZoneBadge zoneId={result.focal_zone} />
-              </div>
-              <div className="grid grid-cols-2 xl:grid-cols-4 gap-2">
-                {[
-                  { label: 'Taxa / Vegetation Class', value: result.species_prediction, color: 'text-emerald-200' },
-                  { label: 'Confidence Score',         value: result.confidence_score != null ? `${(result.confidence_score * 100).toFixed(1)}%` : '—', color: 'text-sky-300' },
-                  {
-                    label: 'Excess Green Index (ExG)',
-                    value: result.excess_green_index != null ? result.excess_green_index.toFixed(4) : '—',
-                    color: result.excess_green_index != null
-                      ? (result.excess_green_index > 0 ? 'text-emerald-300' : 'text-red-300')
-                      : 'text-gray-500',
-                  },
-                  { label: 'Focal Zone', value: result.zone_label, color: 'text-amber-300' },
-                ].map(({ label, value, color }) => (
-                  <div key={label} className="glass p-3 rounded-xl">
-                    <p className="font-jakarta text-[8px] text-gray-600 uppercase tracking-widest">{label}</p>
-                    <p className={`font-grotesk text-[12px] font-semibold truncate mt-0.5 ${color}`}>{value}</p>
-                  </div>
-                ))}
-              </div>
-            </motion.div>
+          return (
+            <motion.div variants={stagger} initial="hidden" animate="visible" exit={{ opacity: 0 }} className="space-y-3">
 
-            {/* Telemetry fusion snapshot */}
-            {result.environmental_telemetry_snapshot &&
-             Object.keys(result.environmental_telemetry_snapshot).length > 0 && (
-              <motion.div variants={panelV} className="glass p-4 rounded-xl border border-teal-900/30 space-y-2">
-                <p className="font-jakarta text-[9px] text-gray-600 uppercase tracking-widest flex items-center gap-1.5">
-                  <Activity size={10} className="text-teal-400" />
-                  Nearest Telemetry Match · ±5 min temporal sync
-                </p>
-                <div className="grid grid-cols-3 xl:grid-cols-6 gap-2">
-                  {ENV_PARAMS.map(({ key, label, unit, color, Icon }) => {
-                    const val = result.environmental_telemetry_snapshot[key];
-                    return (
-                      <div key={key} className="glass p-2 rounded-lg text-center">
-                        <Icon size={10} style={{ color }} className="mx-auto mb-1" />
-                        <p className="font-grotesk text-[11px] font-bold" style={{ color }}>
-                          {val != null ? Number(val).toFixed(1) : '—'}
-                        </p>
-                        <p className="font-jakarta text-[7px] text-gray-700 uppercase tracking-widest">{label}</p>
-                        <p className="font-grotesk text-[7px] text-gray-700">{unit}</p>
-                      </div>
-                    );
-                  })}
+              {/* Main result card */}
+              <motion.div variants={panelV} className="glass border border-emerald-700/30 p-4 rounded-xl space-y-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <CheckCircle2 size={13} className="text-emerald-400 shrink-0" />
+                  <p className="font-jakarta text-[11px] font-semibold text-emerald-300">AI Classification Complete</p>
+                  <FocalZoneBadge zoneId={focalZone} />
                 </div>
-              </motion.div>
-            )}
-
-            {/* Taxonomy breakdown */}
-            {result.taxonomy && Object.keys(result.taxonomy).length > 0 && (
-              <motion.div variants={panelV} className="glass p-4 rounded-xl space-y-2">
-                <p className="font-jakarta text-[9px] text-gray-600 uppercase tracking-widest flex items-center gap-1.5">
-                  <Leaf size={10} className="text-emerald-500" />Taxonomic Classification
-                </p>
-                <div className="grid grid-cols-2 xl:grid-cols-4 gap-1.5">
-                  {Object.entries(result.taxonomy).map(([rank, name]) => (
-                    <div key={rank} className="flex flex-col">
-                      <span className="font-jakarta text-[8px] text-gray-600">{rank}</span>
-                      <span className="font-grotesk text-[10px] text-emerald-200 italic truncate">{name}</span>
+                <div className="grid grid-cols-2 xl:grid-cols-4 gap-2">
+                  {[
+                    { label: 'Taxa / Vegetation Class', value: taxaName, color: 'text-emerald-200' },
+                    { label: 'Confidence %',
+                      value: confScore != null ? `${(confScore * 100).toFixed(1)}%` : '—',
+                      color: 'text-sky-300' },
+                    {
+                      label: 'Excess Green Index (ExG)',
+                      value: exgVal != null ? exgVal.toFixed(4) : '—',
+                      color: exgVal != null ? (exgVal > 0 ? 'text-emerald-300' : 'text-red-300') : 'text-gray-500',
+                    },
+                    { label: 'Focal Zone', value: zoneLabel, color: 'text-amber-300' },
+                  ].map(({ label, value, color }) => (
+                    <div key={label} className="glass p-3 rounded-xl">
+                      <p className="font-jakarta text-[8px] text-gray-600 uppercase tracking-widest">{label}</p>
+                      <p className={`font-grotesk text-[12px] font-semibold truncate mt-0.5 ${color}`}>{value}</p>
                     </div>
                   ))}
                 </div>
               </motion.div>
-            )}
-          </motion.div>
-        )}
+
+              {/* Paired Microclimate Telemetry — ±5 min temporal sync */}
+              {hasTelemetry && (
+                <motion.div variants={panelV} className="glass p-4 rounded-xl border border-teal-900/30 space-y-2">
+                  <p className="font-jakarta text-[9px] text-gray-600 uppercase tracking-widest flex items-center gap-1.5">
+                    <Activity size={10} className="text-teal-400" />
+                    Paired Microclimate Telemetry · ±5 min temporal sync
+                  </p>
+                  <div className="grid grid-cols-3 xl:grid-cols-6 gap-2">
+                    {PAIRED_PARAMS.map(({ key, snapKey, label, unit, color, Icon }) => {
+                      const val = pt[key] ?? snap[snapKey];
+                      return (
+                        <div key={key} className="glass p-2 rounded-lg text-center">
+                          <Icon size={10} style={{ color }} className="mx-auto mb-1" />
+                          <p className="font-grotesk text-[11px] font-bold" style={{ color }}>
+                            {val != null ? Number(val).toFixed(1) : '—'}
+                          </p>
+                          <p className="font-jakarta text-[7px] text-gray-700 uppercase tracking-widest">{label}</p>
+                          <p className="font-grotesk text-[7px] text-gray-700">{unit}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </motion.div>
+              )}
+
+              {/* Taxonomy breakdown */}
+              {taxonomy && Object.keys(taxonomy).length > 0 && (
+                <motion.div variants={panelV} className="glass p-4 rounded-xl space-y-2">
+                  <p className="font-jakarta text-[9px] text-gray-600 uppercase tracking-widest flex items-center gap-1.5">
+                    <Leaf size={10} className="text-emerald-500" />Taxonomic Classification
+                  </p>
+                  <div className="grid grid-cols-2 xl:grid-cols-4 gap-1.5">
+                    {Object.entries(taxonomy).map(([rank, name]) => (
+                      <div key={rank} className="flex flex-col">
+                        <span className="font-jakarta text-[8px] text-gray-600">{rank}</span>
+                        <span className="font-grotesk text-[10px] text-emerald-200 italic truncate">{name}</span>
+                      </div>
+                    ))}
+                  </div>
+                </motion.div>
+              )}
+            </motion.div>
+          );
+        })()}
       </AnimatePresence>
 
       {/* Live micro-climate context when no scan result yet */}

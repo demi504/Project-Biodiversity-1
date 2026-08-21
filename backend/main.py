@@ -1351,6 +1351,161 @@ def upload_image_cv(
 
 
 # ---------------------------------------------------------------------------
+# Classification aliases — /api/classify  |  /api/species/classify
+# Fixes HTTP 404 when frontend calls these routes instead of /api/ground-image/scan
+# ---------------------------------------------------------------------------
+
+async def _classify_shared(
+    file: UploadFile,
+    zone: str = "ZONE_A",
+) -> Dict[str, Any]:
+    """
+    Shared implementation for /api/classify and /api/species/classify.
+
+    Pipeline:
+      1. Validate + persist image to disk.
+      2. MobileNetV3 CV inference → predicted_class + confidence + taxonomy.
+      3. Excess Green Index (ExG = (2G − R − B) / 255).
+      4. Zone-override or default assignment.
+      5. Temporal telemetry sync → nearest sensor_reading within ±5 min.
+      6. Persist to ground_image_uploads.
+
+    Returns a dict compatible with the unified classify schema:
+      status, filename, predicted_class, confidence, exg_index, paired_telemetry
+    """
+    ext = validate_image_upload(file)
+    stored_filename, stored_path, _ = save_upload_to_disk(file, ext)
+
+    # CV inference
+    inference     = _run_cv_inference(stored_path, file.filename or stored_filename)
+    predicted_cls = inference.get("predicted_label", "Unclassified")
+    confidence    = float(inference.get("confidence", 0.0))
+    taxonomy      = inference.get("taxonomy", _TAXONOMY_LOOKUP["default"])
+
+    # Excess Green Index
+    exg = _compute_exg(stored_path)
+
+    # Zone resolution
+    zone_upper = zone.upper()
+    if zone_upper not in (z.value for z in FocalZone):
+        zone_upper = FocalZone.ZONE_A
+    zone_label = ZONE_LABELS.get(zone_upper, zone_upper)
+    ts = utc_now()
+
+    # Temporal telemetry sync
+    telemetry_snapshot: Dict[str, Any] = {}
+    try:
+        with get_connection() as conn:
+            telemetry_snapshot = sync_telemetry_to_timestamp(ts, conn)
+    except Exception:
+        pass
+
+    # Build paired_telemetry in the simplified schema expected by the frontend
+    paired_telemetry = {
+        "temperature":  telemetry_snapshot.get("temperature_c"),
+        "humidity":     telemetry_snapshot.get("humidity_percent"),
+        "light":        telemetry_snapshot.get("light_lux"),
+        "sound":        telemetry_snapshot.get("sound_db"),
+        "pressure":     telemetry_snapshot.get("pressure_hPa"),
+        "altitude":     telemetry_snapshot.get("altitude_m"),
+    }
+
+    # Persist to ground_image_uploads
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO ground_image_uploads
+                  (stored_path, original_filename, species_prediction,
+                   confidence_score, focal_zone, latitude, longitude,
+                   environmental_telemetry, excess_green_index, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(stored_path),
+                    file.filename or "unknown",
+                    predicted_cls,
+                    confidence,
+                    zone_upper,
+                    None,
+                    None,
+                    _json.dumps(telemetry_snapshot),
+                    exg,
+                    to_iso(ts),
+                ),
+            )
+            conn.commit()
+    except sqlite3.Error:
+        pass  # non-fatal — classification result still returned
+
+    return {
+        "status":          "ok",
+        "filename":        file.filename or stored_filename,
+        "predicted_class": predicted_cls,
+        "confidence":      confidence,
+        "exg_index":       exg,
+        "paired_telemetry": paired_telemetry,
+        # extended fields (used by the ground tab result cards)
+        "taxonomy":        taxonomy,
+        "focal_zone":      zone_upper,
+        "zone_label":      zone_label,
+        "timestamp":       to_iso(ts),
+        # legacy compat fields used by GroundImageUploadResponse rendering
+        "species_prediction":               predicted_cls,
+        "confidence_score":                 confidence,
+        "excess_green_index":               exg,
+        "environmental_telemetry_snapshot": telemetry_snapshot,
+    }
+
+
+@app.post("/api/classify")
+@app.post("/api/species/classify")
+async def classify_image(
+    file: UploadFile = File(...),
+    zone: str        = Form("ZONE_A"),
+) -> Dict[str, Any]:
+    """
+    Unified classification endpoint.
+
+    Decorated with both /api/classify and /api/species/classify so the frontend
+    can target either route without a 404.  Accepts a multipart/form-data POST
+    with:
+      • file  — image file (JPG / PNG / WebP / TIF)
+      • zone  — optional focal zone override (ZONE_A | ZONE_B | ZONE_C)
+
+    Returns JSON:
+      {
+        "status":           "ok",
+        "filename":         "IMG_0430.jpg",
+        "predicted_class":  "daisy",
+        "confidence":       0.94,
+        "exg_index":        0.1823,
+        "paired_telemetry": {
+          "temperature": 28.4, "humidity": 71.2,
+          "light": 940.0, "sound": 45.3, ...
+        }
+      }
+    """
+    return await _classify_shared(file, zone)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/telemetry — alias for /sensor-readings (ESP32 compatibility)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/telemetry", response_model=SensorReadingResponse, status_code=status.HTTP_201_CREATED)
+def post_telemetry(payload: SensorReadingCreate) -> SensorReadingResponse:
+    """
+    Alias for POST /sensor-readings.
+
+    Accepts the same 8-parameter ESP32 JSON payload and writes into
+    sensor_readings.  Provided so firmware/test scripts can target the
+    /api/telemetry path without modification.
+    """
+    return create_sensor_reading(payload)
+
+
+# ---------------------------------------------------------------------------
 # Drone endpoints REMOVED in v7 refactor
 # ---------------------------------------------------------------------------
 # POST /drone-images            — legacy drone image endpoint (removed)
