@@ -377,6 +377,38 @@ class GroundImageUploadResponse(BaseModel):
     taxonomy:                        Dict[str, str] = {}
 
 
+class GroundImageBatchItem(BaseModel):
+    """Individual result inside a batch ground image scan response."""
+    image_id:                        int
+    filename:                        str
+    stored_filename:                 str
+    species_prediction:              str
+    predicted_class:                 str
+    confidence_score:                float
+    confidence:                      float
+    focal_zone:                      str
+    zone_label:                      str
+    timestamp:                       datetime
+    latitude:                        Optional[float] = None
+    longitude:                       Optional[float] = None
+    environmental_telemetry_snapshot: Dict[str, Any] = {}
+    paired_telemetry:                Dict[str, Any] = {}
+    excess_green_index:              Optional[float] = None
+    exg_index:                       Optional[float] = None
+    taxonomy:                        Dict[str, str] = {}
+    status:                          str = "ok"
+    error:                           Optional[str] = None
+
+
+class GroundImageBatchResponse(BaseModel):
+    """Response from POST /api/ground-image/batch-scan."""
+    status:                          str = "ok"
+    total_processed:                 int
+    successful:                      int
+    failed:                          int
+    records:                         List[GroundImageBatchItem]
+
+
 # DroneOrthomosaicResponse removed in v7 — drone pipeline discontinued.
 # Drone endpoints (/api/v1/upload-drone-patch, /drone-images) are removed.
 # The drone_patches table is retained to preserve existing survey data.
@@ -1672,6 +1704,223 @@ async def ground_image_scan(
         excess_green_index=exg,
         taxonomy=taxonomy,
     )
+
+
+# ---------------------------------------------------------------------------
+# Ground batch-image scan — Parallel MobileNetV3 + ExG + telemetry fusion
+# ---------------------------------------------------------------------------
+
+@app.post("/api/ground-image/batch-scan", response_model=GroundImageBatchResponse)
+@app.post("/api/classify/batch", response_model=GroundImageBatchResponse)
+@app.post("/api/v1/upload-ground-batch-scan", response_model=GroundImageBatchResponse)
+async def ground_image_batch_scan(
+    images:       Optional[List[UploadFile]] = File(None),
+    files:        Optional[List[UploadFile]] = File(None),
+    ground_files: Optional[List[UploadFile]] = File(None),
+    latitude:     Optional[float]            = Form(None),
+    longitude:    Optional[float]            = Form(None),
+    focal_zone:   Optional[str]              = Form(None, description="Manual zone override: ZONE_A, ZONE_B, or ZONE_C."),
+    zone:         Optional[str]              = Form(None),
+) -> GroundImageBatchResponse:
+    """
+    Bulk/batch ground field photo AI ingestion endpoint.
+
+    Accepts multiple images in a single multipart request (via `images[]`, `images`,
+    `files`, or `ground_files`).
+
+    For each uploaded photo:
+      1. Validates & stores the image to disk.
+      2. Runs MobileNetV3 CV inference for species classification & softmax confidence.
+      3. Computes Excess Green Index (ExG = (2G - R - B) / 255).
+      4. Auto-assigns or overrides Focal Zone (ZONE_A / ZONE_B / ZONE_C).
+      5. Synchronizes with nearest ESP32 8-parameter telemetry snapshot (±5 min buffer).
+      6. Persists occurrence to `ground_image_uploads` and `field_observations` in SQLite.
+      7. Returns consolidated batch results for instant table rendering.
+    """
+    target_zone = focal_zone or zone
+    target_files: List[UploadFile] = []
+    for flist in (images, files, ground_files):
+        if flist:
+            for f in flist:
+                if f and f.filename:
+                    target_files.append(f)
+
+    if not target_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No image files provided for batch processing.",
+        )
+
+    records: List[GroundImageBatchItem] = []
+    successful = 0
+    failed = 0
+
+    with get_connection() as conn:
+        for f in target_files:
+            orig_name = f.filename or "unknown_specimen.jpg"
+            try:
+                ext = validate_image_upload(f)
+                stored_filename, stored_path, _ = save_upload_to_disk(f, ext)
+
+                if not validate_image_file(stored_path):
+                    stored_path.unlink(missing_ok=True)
+                    failed += 1
+                    continue
+
+                # MobileNetV3 CV inference
+                inference  = _run_cv_inference(stored_path, orig_name)
+                species    = inference.get("predicted_label", "Unclassified")
+                confidence = float(inference.get("confidence", 0.0))
+                taxonomy   = inference.get("taxonomy", {})
+
+                # Excess Green Index
+                exg = _compute_exg(stored_path)
+
+                # Zone resolution
+                if target_zone and target_zone.upper() in (z.value for z in FocalZone):
+                    resolved_zone = target_zone.upper()
+                else:
+                    resolved_zone = assign_focal_zone(latitude, longitude)
+                zone_label = ZONE_LABELS.get(resolved_zone, resolved_zone)
+                ts = utc_now()
+
+                # Temporal telemetry synchronization
+                telemetry_snapshot = sync_telemetry_to_timestamp(ts, conn)
+                paired_telemetry = {
+                    "temperature": telemetry_snapshot.get("temperature_c"),
+                    "humidity":    telemetry_snapshot.get("humidity_percent"),
+                    "light":       telemetry_snapshot.get("light_lux"),
+                    "sound":       telemetry_snapshot.get("sound_db"),
+                    "pressure":    telemetry_snapshot.get("pressure_hPa"),
+                    "altitude":    telemetry_snapshot.get("altitude_m"),
+                }
+
+                # Persist to ground_image_uploads
+                cursor = conn.execute(
+                    """
+                    INSERT INTO ground_image_uploads
+                      (stored_path, original_filename, species_prediction,
+                       confidence_score, focal_zone, latitude, longitude,
+                       environmental_telemetry, excess_green_index, timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(stored_path),
+                        orig_name,
+                        species,
+                        confidence,
+                        resolved_zone,
+                        latitude,
+                        longitude,
+                        _json.dumps(telemetry_snapshot),
+                        exg,
+                        to_iso(ts),
+                    ),
+                )
+                image_id = cursor.lastrowid
+
+                # Also insert into field_observations for unified biodiversity reporting
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO field_observations (
+                            ground_image_path, category, kingdom, phylum, class, order_name,
+                            family, genus, species, common_name, annotation_confidence,
+                            observer_id, date, time, data_source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AI_BATCH_SCAN', ?, ?, 'GROUND_BATCH')
+                        """,
+                        (
+                            str(stored_path),
+                            taxonomy.get("category"),  taxonomy.get("Kingdom") or taxonomy.get("kingdom"),
+                            taxonomy.get("Phylum") or taxonomy.get("phylum"),
+                            taxonomy.get("Class") or taxonomy.get("class"),
+                            taxonomy.get("Order") or taxonomy.get("order"),
+                            taxonomy.get("Family") or taxonomy.get("family"),
+                            taxonomy.get("Genus") or taxonomy.get("genus"),
+                            taxonomy.get("Species") or taxonomy.get("species"),
+                            species,
+                            confidence,
+                            ts.strftime("%Y-%m-%d"),
+                            ts.strftime("%H:%M:%S"),
+                        ),
+                    )
+                except Exception:
+                    pass
+
+                item = GroundImageBatchItem(
+                    image_id=image_id,
+                    filename=orig_name,
+                    stored_filename=stored_filename,
+                    species_prediction=species,
+                    predicted_class=species,
+                    confidence_score=confidence,
+                    confidence=confidence,
+                    focal_zone=resolved_zone,
+                    zone_label=zone_label,
+                    timestamp=ts,
+                    latitude=latitude,
+                    longitude=longitude,
+                    environmental_telemetry_snapshot=telemetry_snapshot,
+                    paired_telemetry=paired_telemetry,
+                    excess_green_index=exg,
+                    exg_index=exg,
+                    taxonomy=taxonomy,
+                    status="ok",
+                )
+                records.append(item)
+                successful += 1
+            except Exception as err:
+                failed += 1
+                records.append(
+                    GroundImageBatchItem(
+                        image_id=-1,
+                        filename=orig_name,
+                        stored_filename="",
+                        species_prediction="Failed",
+                        predicted_class="Failed",
+                        confidence_score=0.0,
+                        confidence=0.0,
+                        focal_zone=target_zone or "ZONE_A",
+                        zone_label=ZONE_LABELS.get(target_zone or "ZONE_A", target_zone or "ZONE_A"),
+                        timestamp=utc_now(),
+                        status="error",
+                        error=str(err),
+                    )
+                )
+
+        conn.commit()
+
+    return GroundImageBatchResponse(
+        status="ok",
+        total_processed=len(target_files),
+        successful=successful,
+        failed=failed,
+        records=records,
+    )
+
+
+@app.get("/api/ground-image/stats")
+def ground_image_stats() -> Dict[str, Any]:
+    """Return total count and per-zone distribution of ground images with fused telemetry."""
+    try:
+        with get_connection() as conn:
+            total = conn.execute("SELECT COUNT(*) as c FROM ground_image_uploads").fetchone()["c"]
+            zone_rows = conn.execute(
+                "SELECT focal_zone, COUNT(*) as c FROM ground_image_uploads GROUP BY focal_zone"
+            ).fetchall()
+            zone_counts = {r["focal_zone"]: r["c"] for r in zone_rows}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Failed to fetch ground stats: {exc}",
+        ) from exc
+
+    return {
+        "status": "ok",
+        "total_records": total,
+        "zone_counts": zone_counts,
+    }
+
 
 
 # ---------------------------------------------------------------------------
