@@ -294,10 +294,14 @@ def ingest_biodata_csv(csv_path: Path) -> List[Dict[str, Any]]:
     """
     Parse the ESP32 MicroSD CSV log.
 
+    Supported column names (ESP32 actual format):
+      Timestamp, Zone, Temperature(C), Humidity(%), Pressure(hPa),
+      Altitude(m), Light(lx), Sound(dB)
+
     Cleaning rules:
+      - Skip rows where timestamp contains 'Time Sync Error'.
       - Skip rows where temperature == 0°C (startup transient).
-      - Skip rows with any negative numeric value in sensor columns.
-      - Skip rows whose timestamp field contains 'Time Sync Error'.
+      - Skip rows with any negative value in sensor columns.
       - Skip rows with pressure outside 800–1100 hPa.
       - Skip rows with humidity outside 0–100%.
     """
@@ -315,36 +319,65 @@ def ingest_biodata_csv(csv_path: Path) -> List[Dict[str, Any]]:
             row = {k.strip(): v.strip() for k, v in row.items()}
 
             # --- Timestamp guard ---
-            ts_val = row.get("timestamp") or row.get("Timestamp") or row.get("time") or ""
+            ts_val = (row.get("Timestamp") or row.get("timestamp")
+                      or row.get("time") or row.get("Time") or "")
             if "time sync error" in ts_val.lower():
                 log.debug("Row %d: 'Time Sync Error' — dropped.", i)
                 skipped += 1
                 continue
 
-            # --- Numeric extraction helpers ---
+            # --- Numeric extraction helper (tries all known column name variants) ---
             def _float(key: str, default: float = 0.0) -> float:
                 try:
                     return float(row.get(key, default))
                 except (TypeError, ValueError):
                     return default
 
-            temp     = _float("temperature_c") or _float("temperature") or _float("Temperature_C")
-            humidity = _float("humidity_percent") or _float("humidity") or _float("Humidity_Pct")
-            pressure = _float("pressure_hPa") or _float("pressure") or _float("Pressure_hPa")
-            lux      = _float("light_lux")  or _float("light") or _float("Light_Lux")
-            sound    = _float("sound_db")   or _float("sound") or _float("Sound_dB")
+            # ESP32 actual column names take priority; legacy fallbacks follow
+            temp = (
+                _float("Temperature(C)") or _float("temperature_c")
+                or _float("temperature") or _float("Temperature_C")
+                or _float("Temperature (°C)") or _float("Temperature (C)")
+            )
+            humidity = (
+                _float("Humidity(%)") or _float("humidity_percent")
+                or _float("humidity") or _float("Humidity_Pct")
+                or _float("Humidity (%)")
+            )
+            pressure = (
+                _float("Pressure(hPa)") or _float("pressure_hPa")
+                or _float("pressure") or _float("Pressure_hPa")
+                or _float("Pressure (hPa)")
+            )
+            lux = (
+                _float("Light(lx)") or _float("light_lux")
+                or _float("light") or _float("Light_Lux")
+                or _float("Light (Lux)")
+            )
+            sound = (
+                _float("Sound(dB)") or _float("sound_db")
+                or _float("sound") or _float("Sound_dB")
+                or _float("Sound (dB)")
+            )
+            altitude = (
+                _float("Altitude(m)") or _float("altitude_m")
+                or _float("Altitude") or _float("altitude")
+            )
+
+            # Zone embedded directly in ESP32 CSV (ZONE_A / ZONE_B / ZONE_C)
+            csv_zone = (row.get("Zone") or row.get("zone") or "").strip().upper()
 
             # --- Cleaning filters ---
             if temp == 0.0:
                 log.debug("Row %d: temperature=0°C (startup transient) — dropped.", i)
                 skipped += 1
                 continue
-            if any(v < 0 for v in (temp, humidity, pressure, lux, sound)):
+            if any(v < 0 for v in (temp, humidity, lux, sound)):
                 log.debug("Row %d: negative sensor value — dropped.", i)
                 skipped += 1
                 continue
             if not (-10 <= temp <= 60):
-                log.debug("Row %d: temperature %.1f°C out of physiological range — dropped.", i, temp)
+                log.debug("Row %d: temperature %.1f°C out of range — dropped.", i, temp)
                 skipped += 1
                 continue
             if not (0 <= humidity <= 100):
@@ -359,14 +392,15 @@ def ingest_biodata_csv(csv_path: Path) -> List[Dict[str, Any]]:
             records.append({
                 "source":       "SD_CARD_CSV",
                 "timestamp_str": ts_val,
+                "csv_zone":      csv_zone if csv_zone in ("ZONE_A", "ZONE_B", "ZONE_C") else "",
                 "temperature_C":          temp,
                 "relativeHumidity_Pct":   humidity,
                 "barometricPressure_hPa": pressure if pressure else 1013.25,
                 "ambientIlluminance_Lux": lux,
                 "soundPressureLevel_dB":  sound,
-                "latitude":  _float("latitude")  or None,
-                "longitude": _float("longitude") or None,
-                "altitude_m": _float("altitude_m") or None,
+                "latitude":  _float("Latitude")  or _float("latitude")  or None,
+                "longitude": _float("Longitude") or _float("longitude") or None,
+                "altitude_m": altitude or None,
             })
 
     log.info("biodata.csv: %d clean rows ingested, %d rows dropped.", len(records), skipped)
@@ -478,14 +512,19 @@ def compute_exg(image_path: Path) -> Optional[float]:
     if not _HAS_PIL:
         return None
     try:
-        img = _PILImage.open(image_path).convert("RGB")
-        # Downsample to 256×256 for speed (representative sample)
-        img.thumbnail((256, 256))
-        pixels = list(img.getdata())
-        if not pixels:
-            return None
-        total_exg = sum(2 * g - r - b for r, g, b in pixels)
-        return round(total_exg / len(pixels), 4)
+        with _PILImage.open(image_path) as img:
+            img_rgb = img.convert("RGB")
+            img_rgb.thumbnail((256, 256))
+            if _HAS_NUMPY:
+                arr = np.asarray(img_rgb, dtype=np.float32)
+                exg_map = 2.0 * arr[:, :, 1] - arr[:, :, 0] - arr[:, :, 2]
+                return round(float(np.mean(exg_map)), 4)
+            else:
+                pixels = list(img_rgb.getdata())
+                if not pixels:
+                    return None
+                total_exg = sum(2 * g - r - b for r, g, b in pixels)
+                return round(total_exg / len(pixels), 4)
     except Exception as exc:
         log.debug("ExG computation failed for %s: %s", image_path.name, exc)
         return None
@@ -511,7 +550,7 @@ def estimate_canopy_cover(exg: Optional[float]) -> Optional[float]:
 # ===========================================================================
 
 PLANTNET_URL      = "https://my.plantnet.org/api/v2/identify/all"
-PLANTNET_TIMEOUT  = 30
+PLANTNET_TIMEOUT  = 12
 AI_MODEL_ID       = "PlantNet-v2 / MobileNetV3-UNIBEN-ft"
 
 
@@ -1002,67 +1041,116 @@ def run_pipeline() -> None:
         return
 
     # ------------------------------------------------------------------
-    # Step 3 — Per-image processing loop
+    # Step 3 — Per-image processing loop (concurrent PlantNet calls)
     # ------------------------------------------------------------------
-    log.info("[3/5] Processing images (PlantNet + ExG + telemetry fusion) …")
+    log.info("[3/5] Processing %d images concurrently (PlantNet + ExG + telemetry fusion) …", len(image_paths))
+    log.info("      Using up to 8 parallel PlantNet API workers.")
 
-    all_dwc_records: List[Dict[str, Any]] = []
+    import concurrent.futures
+    import threading
 
-    # Round-robin zone assignment when GPS is absent (distributes across all 3 zones)
+    _sensor_lock = threading.Lock()   # sensor_pool is read-only after this point
+    # Round-robin zone assignment when GPS/EXIF zone is absent
     zone_cycle = ["ZONE_A", "ZONE_B", "ZONE_C"]
 
-    for i, img_path in enumerate(image_paths):
-        log.info("  [%d/%d] %s", i + 1, len(image_paths), img_path.name)
+    def _process_one(args):
+        i, img_path = args
+        result = {"index": i, "img_path": img_path, "record": None, "error": None}
+        try:
+            # EXIF timestamp
+            image_ts = extract_exif_timestamp(img_path)
 
-        # -- EXIF timestamp --
-        image_ts = extract_exif_timestamp(img_path)
-        log.info("    EXIF timestamp: %s", image_ts)
+            # ExG
+            exg = compute_exg(img_path)
 
-        # -- ExG --
-        exg = compute_exg(img_path)
-        log.info("    ExG = %s", exg)
+            # Zone assignment: check sensor pool for csv_zone within ±5 min
+            zone = zone_cycle[i % len(zone_cycle)]
+            if image_ts and sensor_pool:
+                for r in sensor_pool:
+                    r_ts = _parse_sensor_timestamp(r.get("timestamp_str", ""))
+                    if r_ts and abs((image_ts - r_ts).total_seconds()) <= 300:
+                        if r.get("csv_zone") in ("ZONE_A", "ZONE_B", "ZONE_C"):
+                            zone = r["csv_zone"]
+                            break
 
-        # -- Zone assignment (GPS fallback: round-robin) --
-        zone = zone_cycle[i % len(zone_cycle)]
-        log.info("    Zone: %s", zone)
+            # PlantNet classification
+            taxonomy, latency_ms = classify_image_plantnet(img_path, PLANTNET_API_KEY)
 
-        # -- PlantNet classification --
-        taxonomy, latency_ms = classify_image_plantnet(img_path, PLANTNET_API_KEY)
-        status = taxonomy.get("enrichment_status", "unknown")
-        log.info(
-            "    PlantNet: %s  (conf=%.3f  latency=%.0fms)",
-            taxonomy.get("scientificName", "?"),
-            taxonomy.get("aiClassificationConfidence", 0.0),
-            latency_ms,
-        )
-        if status != "enriched":
-            log.warning("    PlantNet status: %s — using zone fallback taxonomy.", status)
+            # Fallback species
+            fallback_species_list = ZONE_METADATA[zone]["fallback_species"]
+            fallback_sp = fallback_species_list[i % len(fallback_species_list)]
 
-        # -- Pick a fallback species for this image index within zone --
-        fallback_species_list = ZONE_METADATA[zone]["fallback_species"]
-        fallback_sp = fallback_species_list[i % len(fallback_species_list)]
+            # Telemetry fusion
+            sensor, fusion_tier = fuse_telemetry(image_ts, sensor_pool, zone)
 
-        # -- Telemetry fusion --
-        sensor, fusion_tier = fuse_telemetry(image_ts, sensor_pool, zone)
-        log.info("    Fusion tier: %s  → temp=%.1f°C  RH=%.1f%%",
-                 fusion_tier, sensor.get("temperature_C", 0), sensor.get("relativeHumidity_Pct", 0))
+            # DwC record
+            rec = build_dwc_record(
+                image_path=img_path,
+                image_ts=image_ts,
+                zone=zone,
+                taxonomy=taxonomy,
+                latency_ms=latency_ms,
+                exg=exg,
+                sensor=sensor,
+                fusion_tier=fusion_tier,
+                record_index=i + 1,
+                fallback_species=fallback_sp,
+            )
+            result["record"] = rec
+            result["zone"] = zone
+            result["fusion_tier"] = fusion_tier
+            result["conf"] = taxonomy.get("aiClassificationConfidence", 0.0)
+            result["sci_name"] = taxonomy.get("scientificName", "?")
+            result["enrich"] = taxonomy.get("enrichment_status", "?")
+        except Exception as exc:
+            result["error"] = str(exc)
+            log.error("  Error processing %s: %s", img_path.name, exc)
+        return result
 
-        # -- Build DwC record --
-        rec = build_dwc_record(
-            image_path=img_path,
-            image_ts=image_ts,
-            zone=zone,
-            taxonomy=taxonomy,
-            latency_ms=latency_ms,
-            exg=exg,
-            sensor=sensor,
-            fusion_tier=fusion_tier,
-            record_index=i + 1,
-            fallback_species=fallback_sp,
-        )
-        all_dwc_records.append(rec)
+    all_dwc_records: List[Dict[str, Any]] = []
+    enriched_count = 0
+    fallback_count = 0
 
-    log.info("Processing complete. Total DwC records: %d", len(all_dwc_records))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(_process_one, (i, p)): i
+            for i, p in enumerate(image_paths)
+        }
+        completed = 0
+        results_map = {}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results_map[result["index"]] = result
+            completed += 1
+            # Progress log every 25 images
+            if completed % 25 == 0 or completed == len(image_paths):
+                log.info("  Progress: %d / %d images processed (%.0f%%)",
+                         completed, len(image_paths),
+                         100 * completed / len(image_paths))
+
+    # Reassemble in original order
+    for i in range(len(image_paths)):
+        result = results_map.get(i)
+        if result and result["record"]:
+            all_dwc_records.append(result["record"])
+            if result.get("enrich") == "enriched":
+                enriched_count += 1
+            else:
+                fallback_count += 1
+            log.info(
+                "  [%d/%d] %s → %s zone=%s conf=%.3f %s",
+                i + 1, len(image_paths),
+                image_paths[i].name,
+                result.get("sci_name", "?"),
+                result.get("zone", "?"),
+                result.get("conf", 0.0),
+                result.get("fusion_tier", "?"),
+            )
+
+    log.info(
+        "Processing complete. Total DwC records: %d  (PlantNet enriched: %d | fallback: %d)",
+        len(all_dwc_records), enriched_count, fallback_count,
+    )
 
     # ------------------------------------------------------------------
     # Step 4 — Export
