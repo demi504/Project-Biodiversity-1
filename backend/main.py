@@ -1710,6 +1710,7 @@ async def ground_image_scan(
 # Ground batch-image scan — Parallel MobileNetV3 + ExG + telemetry fusion
 # ---------------------------------------------------------------------------
 
+@app.post("/api/ingest/batch-ground-photos", response_model=GroundImageBatchResponse)
 @app.post("/api/ground-image/batch-scan", response_model=GroundImageBatchResponse)
 @app.post("/api/classify/batch", response_model=GroundImageBatchResponse)
 @app.post("/api/v1/upload-ground-batch-scan", response_model=GroundImageBatchResponse)

@@ -598,7 +598,7 @@ function SensorTelemetryTab({ readings, histories, geoCoords, wsState, onIngestC
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Tab 2 — Ground Field Photo AI Ingestion (Batch / Bulk Pipeline)            */
+/*  Tab 2 — Ground Field Photo AI Ingestion (Full Folder & Batch Engine)       */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 function formatFileSize(bytes) {
@@ -609,13 +609,78 @@ function formatFileSize(bytes) {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
+/**
+ * Recursively extracts all image files from a FileSystemEntry (file or directory).
+ */
+async function getFilesFromEntry(entry) {
+  if (!entry) return [];
+  if (entry.isFile) {
+    return new Promise((resolve) => {
+      entry.file((file) => {
+        if (file && (file.type.startsWith('image/') || /\.(jpe?g|png|webp|tif|tiff)$/i.test(file.name))) {
+          resolve([file]);
+        } else {
+          resolve([]);
+        }
+      }, () => resolve([]));
+    });
+  } else if (entry.isDirectory) {
+    const dirReader = entry.createReader();
+    const readEntriesPromise = () =>
+      new Promise((resolve) => {
+        dirReader.readEntries((entries) => {
+          resolve(entries || []);
+        }, () => resolve([]));
+      });
+
+    let allEntries = [];
+    let batch = await readEntriesPromise();
+    while (batch.length > 0) {
+      allEntries = allEntries.concat(batch);
+      batch = await readEntriesPromise();
+    }
+
+    const subFilesPromises = allEntries.map(getFilesFromEntry);
+    const subFilesArrays = await Promise.all(subFilesPromises);
+    return subFilesArrays.flat();
+  }
+  return [];
+}
+
+/**
+ * Extracts files from drag-and-drop DataTransfer, using DataTransferItemList & webkitGetAsEntry
+ * for recursive directory traversal when folders are dropped.
+ */
+async function extractFilesFromDataTransfer(items, dataTransferFiles) {
+  if (items && items.length > 0) {
+    const entries = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.webkitGetAsEntry) {
+        const entry = item.webkitGetAsEntry();
+        if (entry) entries.push(entry);
+      } else if (item.getAsEntry) {
+        const entry = item.getAsEntry();
+        if (entry) entries.push(entry);
+      }
+    }
+    if (entries.length > 0) {
+      const filesArrays = await Promise.all(entries.map(getFilesFromEntry));
+      return filesArrays.flat();
+    }
+  }
+  return Array.from(dataTransferFiles || []).filter(f =>
+    f.type.startsWith('image/') || /\.(jpe?g|png|webp|tif|tiff)$/i.test(f.name)
+  );
+}
+
 function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
   const [queuedFiles,    setQueuedFiles]    = useState([]);
   const [zone,           setZone]           = useState('ZONE_B');
   const [scanning,       setScanning]       = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [scanStatusMsg,  setScanStatusMsg]  = useState('');
-  const [batchResults,   setBatchResults]   = useState([]);
+  const [liveResults,    setLiveResults]    = useState([]);
   const [error,          setError]          = useState('');
   const [dragging,       setDragging]       = useState(false);
 
@@ -666,7 +731,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
     setScanStatusMsg('');
   }, [queuedFiles]);
 
-  // Drag & drop handlers supporting multiple files
+  // Drag & drop handlers supporting recursive folder extraction
   const onDragOver = useCallback(e => {
     e.preventDefault();
     setDragging(true);
@@ -676,81 +741,107 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
     setDragging(false);
   }, []);
 
-  const onDrop = useCallback(e => {
+  const onDrop = useCallback(async (e) => {
     e.preventDefault();
     setDragging(false);
-    if (e.dataTransfer?.files?.length) {
-      addFiles(e.dataTransfer.files);
+    try {
+      const extracted = await extractFilesFromDataTransfer(e.dataTransfer?.items, e.dataTransfer?.files);
+      if (extracted && extracted.length > 0) {
+        addFiles(extracted);
+      }
+    } catch (err) {
+      if (e.dataTransfer?.files?.length) {
+        addFiles(e.dataTransfer.files);
+      }
     }
   }, [addFiles]);
 
-  // Execute batch ingestion pipeline
+  // Execute chunked batch ingestion pipeline (/api/ingest/batch-ground-photos)
   const processBatch = useCallback(async () => {
     if (!queuedFiles.length) {
-      setError('Please add or drop ground photos into the batch queue first.');
+      setError('Please select or drop ground photo folders / files into the queue first.');
       return;
     }
     setScanning(true);
     setError('');
-    setUploadProgress(15);
-    setScanStatusMsg(`Preparing ${queuedFiles.length} photos for multipart ingestion...`);
+    setUploadProgress(0);
+
+    const totalImages = queuedFiles.length;
+    const CHUNK_SIZE = 20;
+    const chunks = [];
+    for (let i = 0; i < totalImages; i += CHUNK_SIZE) {
+      chunks.push(queuedFiles.slice(i, i + CHUNK_SIZE));
+    }
+
+    setScanStatusMsg(`Starting batch classification for ${totalImages} images in ${chunks.length} chunks...`);
+
+    let processedCount = 0;
+    let accumulatedResults = [];
 
     try {
-      const fd = new FormData();
-      queuedFiles.forEach(item => {
-        fd.append('images', item.file);
-        fd.append('files', item.file);
-      });
-      fd.append('zone', zone);
-      fd.append('focal_zone', zone);
-      if (geoCoords?.latitude != null) fd.append('latitude', geoCoords.latitude);
-      if (geoCoords?.longitude != null) fd.append('longitude', geoCoords.longitude);
-
-      setUploadProgress(40);
-      setScanStatusMsg('Running parallel MobileNetV3 inference & Excess Green Index (ExG)...');
-
-      let res = await fetch(`${API}/api/ground-image/batch-scan`, {
-        method: 'POST',
-        body: fd,
-      });
-
-      if (res.status === 404 || res.status === 405) {
-        // Fallback: parallel classify
-        setScanStatusMsg('Fallback: Running parallel /api/classify requests...');
-        const parallelPromises = queuedFiles.map(async (item, idx) => {
-          const sfd = new FormData();
-          sfd.append('file', item.file);
-          sfd.append('zone', zone);
-          sfd.append('focal_zone', zone);
-          if (geoCoords?.latitude != null) sfd.append('latitude', geoCoords.latitude);
-          if (geoCoords?.longitude != null) sfd.append('longitude', geoCoords.longitude);
-          const r = await fetch(`${API}/api/classify`, { method: 'POST', body: sfd });
-          const d = await r.json();
-          setUploadProgress(Math.min(90, 40 + Math.round(((idx + 1) / queuedFiles.length) * 50)));
-          return d;
+      for (let cIdx = 0; cIdx < chunks.length; cIdx++) {
+        const chunk = chunks[cIdx];
+        const fd = new FormData();
+        chunk.forEach(item => {
+          fd.append('images', item.file);
+          fd.append('files', item.file);
         });
-        const fallbackItems = await Promise.all(parallelPromises);
-        setBatchResults(prev => [...fallbackItems, ...prev]);
-        setUploadProgress(100);
-        setScanStatusMsg('Batch processing complete!');
-        clearQueue();
-        onScanComplete?.();
-        return;
+        fd.append('zone', zone);
+        fd.append('focal_zone', zone);
+        if (geoCoords?.latitude != null) fd.append('latitude', geoCoords.latitude);
+        if (geoCoords?.longitude != null) fd.append('longitude', geoCoords.longitude);
+
+        setScanStatusMsg(`Processing chunk ${cIdx + 1}/${chunks.length} (${processedCount}/${totalImages} classified)...`);
+
+        let res = await fetch(`${API}/api/ingest/batch-ground-photos`, {
+          method: 'POST',
+          body: fd,
+        });
+
+        if (res.status === 404 || res.status === 405) {
+          // Fallback to /api/ground-image/batch-scan
+          res = await fetch(`${API}/api/ground-image/batch-scan`, {
+            method: 'POST',
+            body: fd,
+          });
+        }
+
+        if (res.status === 404 || res.status === 405) {
+          // Parallel classify fallback for this chunk
+          const parallelPromises = chunk.map(async (item) => {
+            const sfd = new FormData();
+            sfd.append('file', item.file);
+            sfd.append('zone', zone);
+            sfd.append('focal_zone', zone);
+            if (geoCoords?.latitude != null) sfd.append('latitude', geoCoords.latitude);
+            if (geoCoords?.longitude != null) sfd.append('longitude', geoCoords.longitude);
+            const r = await fetch(`${API}/api/classify`, { method: 'POST', body: sfd });
+            return r.json();
+          });
+          const fallbackChunk = await Promise.all(parallelPromises);
+          accumulatedResults = [...fallbackChunk, ...accumulatedResults];
+          setLiveResults(prev => [...fallbackChunk, ...prev]);
+        } else if (res.ok) {
+          const data = await res.json();
+          const records = (data.records || []).map((r, i) => ({
+            ...r,
+            previewUrl: chunk[i]?.previewUrl || null,
+          }));
+          accumulatedResults = [...records, ...accumulatedResults];
+          setLiveResults(prev => [...records, ...prev]);
+        } else {
+          throw new Error(`HTTP ${res.status} — ${await res.text()}`);
+        }
+
+        processedCount += chunk.length;
+        const pct = Math.min(100, Math.round((processedCount / totalImages) * 100));
+        setUploadProgress(pct);
       }
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} — ${await res.text()}`);
-      }
-
-      setUploadProgress(85);
-      setScanStatusMsg('Synchronizing ESP32 microclimate telemetry snapshot & saving...');
-
-      const data = await res.json();
-      const records = data.records || [];
-      setBatchResults(prev => [...records, ...prev]);
       setUploadProgress(100);
-      setScanStatusMsg(`Successfully processed ${records.length} records.`);
+      setScanStatusMsg(`Batch complete! Successfully classified and fused ${totalImages} image records.`);
       clearQueue();
+      // Automatically increment & sync the global "Fused Multi-Modal Records" counter
       onScanComplete?.();
     } catch (err) {
       setError(err.message);
@@ -761,13 +852,13 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
 
   // Export batch results to CSV
   const exportBatchCSV = useCallback(() => {
-    if (!batchResults.length) return;
+    if (!liveResults.length) return;
     const headers = [
       'Filename', 'Species_Prediction', 'Focal_Zone', 'Confidence_Score',
       'Excess_Green_Index_ExG', 'Temperature_C', 'Humidity_Pct', 'Pressure_hPa',
-      'Illuminance_Lux', 'Sound_dB', 'Timestamp'
+      'Illuminance_Lux', 'Sound_dB', 'Status', 'Timestamp'
     ];
-    const rows = batchResults.map(r => {
+    const rows = liveResults.map(r => {
       const pt = r.paired_telemetry || r.environmental_telemetry_snapshot || {};
       return [
         `"${r.filename || r.original_filename || ''}"`,
@@ -780,6 +871,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
         pt.pressure ?? pt.pressure_hPa ?? '',
         pt.light ?? pt.light_lux ?? '',
         pt.sound ?? pt.sound_db ?? '',
+        `"${r.status || 'ok'}"`,
         `"${r.timestamp || ''}"`
       ].join(',');
     });
@@ -787,14 +879,14 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
     const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
     link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `UNIBEN_Batch_Ground_Classification_${new Date().toISOString().slice(0,10)}.csv`);
+    link.setAttribute('download', `UNIBEN_Ground_Batch_Inference_${new Date().toISOString().slice(0,10)}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-  }, [batchResults]);
+  }, [liveResults]);
 
-  // Filtered batch results
-  const filteredResults = batchResults.filter(r => {
+  // Filtered live results
+  const filteredResults = liveResults.filter(r => {
     const fn   = (r.filename || r.original_filename || '').toLowerCase();
     const sp   = (r.species_prediction || r.predicted_class || '').toLowerCase();
     const term = searchTerm.toLowerCase();
@@ -815,14 +907,14 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
         <div className="flex-1">
           <div className="flex items-center gap-2">
             <p className="font-jakarta text-[11px] font-semibold text-emerald-300">
-              🌿 Ground Field Photo AI Ingestion (Bulk &amp; Batch Engine)
+              🌿 Ground Field Photo AI Ingestion (Folder &amp; Batch Pipeline)
             </p>
             <span className="font-grotesk text-[8px] bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 px-2 py-0.5 rounded-full font-bold">
-              BATCH ENABLED
+              BATCH RECURSIVE
             </span>
           </div>
           <p className="font-grotesk text-[9px] text-gray-500 mt-0.5">
-            Multi-file / folder drop · MobileNetV3-Small parallel taxa classifier · Excess Green Index (ExG) · ESP32 microclimate telemetry fusion
+            Full directory / multi-file drop (Day 1, Day 2, Day 3) · Chunked inference (/api/ingest/batch-ground-photos) · Live streaming results table · ExG &amp; Telemetry fusion
           </p>
         </div>
         {geoCoords && (
@@ -832,20 +924,22 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
         )}
       </motion.div>
 
-      {/* Batch Dropzone & Queue Controller */}
+      {/* Batch Processing UI & Execution Queue Controller */}
       <motion.div variants={panelV} className="glass p-4 flex flex-col gap-3">
-        {/* Controls bar */}
+        {/* Controls bar with Queue Badge */}
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-2">
-            <Leaf size={13} className="text-emerald-400" />
+            <Layers size={13} className="text-emerald-400" />
             <p className="font-jakarta text-[10px] font-semibold text-emerald-300">
-              Batch Ingestion Queue
+              Batch Processing Queue
             </p>
-            {queuedFiles.length > 0 && (
-              <span className="bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-grotesk text-[9px] font-bold px-2 py-0.5 rounded-full">
-                {queuedFiles.length} {queuedFiles.length === 1 ? 'photo' : 'photos'} queued ({formatFileSize(totalQueuedBytes)})
-              </span>
-            )}
+            <span className={`font-grotesk text-[9px] font-bold px-2 py-0.5 rounded-full border ${
+              queuedFiles.length > 0
+                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-[0_0_12px_rgba(16,185,129,0.2)]'
+                : 'bg-gray-800/40 text-gray-500 border-gray-700/30'
+            }`}>
+              Queued: {queuedFiles.length} image{queuedFiles.length !== 1 ? 's' : ''} {queuedFiles.length > 0 ? `(${formatFileSize(totalQueuedBytes)})` : ''}
+            </span>
           </div>
 
           <div className="flex items-center gap-2 ml-auto flex-wrap">
@@ -861,7 +955,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
           </div>
         </div>
 
-        {/* Multi-file & Folder Dropzone */}
+        {/* Multi-file & Folder Dropzone with Recursive Directory Ingestion */}
         <div
           ref={dropRef}
           onDragOver={onDragOver}
@@ -876,7 +970,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
             minHeight:   queuedFiles.length ? 140 : 180,
           }}
         >
-          {/* Hidden inputs */}
+          {/* Hidden multi-file input */}
           <input
             ref={fileInputRef}
             type="file"
@@ -885,6 +979,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
             className="hidden"
             onChange={e => { addFiles(e.target.files); e.target.value = ''; }}
           />
+          {/* Hidden directory folder input */}
           <input
             ref={folderInputRef}
             type="file"
@@ -897,14 +992,14 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
 
           <div className="flex items-center justify-center gap-3">
             <div className="w-10 h-10 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center">
-              <Images size={20} className="text-emerald-400" />
+              <FolderUp size={20} className="text-emerald-400" />
             </div>
             <div className="text-left">
               <p className="font-jakarta text-[11px] font-bold text-gray-200">
-                Drag &amp; drop multiple ground photos here, or click to browse
+                Drag &amp; drop folders (e.g. Day 1, Day 2) or multiple ground images here
               </p>
               <p className="font-grotesk text-[9px] text-gray-500 mt-0.5">
-                Supports batch selection of JPG / PNG field photos or full directory trees
+                Automatically scans subfolders recursively using webkitGetAsEntry()
               </p>
             </div>
           </div>
@@ -915,14 +1010,14 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
               onClick={() => fileInputRef.current?.click()}
               className="px-3 py-1.5 rounded-lg bg-emerald-950/60 hover:bg-emerald-900/80 border border-emerald-700/40 text-emerald-300 font-jakarta text-[9px] font-semibold flex items-center gap-1.5 transition-colors"
             >
-              <UploadCloud size={11} /> Select Multiple Files
+              <UploadCloud size={11} /> Select Images
             </button>
             <button
               type="button"
               onClick={() => folderInputRef.current?.click()}
               className="px-3 py-1.5 rounded-lg bg-[#141B2D] hover:bg-[#1C263E] border border-gray-700 text-gray-300 font-jakarta text-[9px] font-semibold flex items-center gap-1.5 transition-colors"
             >
-              <FolderUp size={11} /> Ingest Folder
+              <FolderUp size={11} /> Select Folder (Day 1 / Day 2 / Day 3)
             </button>
           </div>
         </div>
@@ -932,7 +1027,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="font-jakarta text-[9px] uppercase tracking-wider text-gray-500 font-semibold">
-                Queued Image Specimens ({queuedFiles.length})
+                Detected Specimen Queue ({queuedFiles.length})
               </span>
               <button
                 type="button"
@@ -978,7 +1073,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
           </div>
         )}
 
-        {/* Progress Bar & Status during processing */}
+        {/* Progress Bar & Status during batch processing */}
         {scanning && (
           <motion.div
             initial={{ opacity: 0, height: 0 }}
@@ -988,7 +1083,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
             <div className="flex items-center justify-between text-[10px] font-jakarta">
               <span className="text-emerald-300 font-bold flex items-center gap-2">
                 <RefreshCw size={12} className="animate-spin text-emerald-400" />
-                {scanStatusMsg || 'Processing Batch Photos...'}
+                {scanStatusMsg || 'Processing Batch Classification (0% -> 100%)...'}
               </span>
               <span className="font-mono text-emerald-400 font-bold">{uploadProgress}%</span>
             </div>
@@ -997,13 +1092,13 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
                 className="h-full bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-300"
                 initial={{ width: 0 }}
                 animate={{ width: `${uploadProgress}%` }}
-                transition={{ ease: 'easeOut', duration: 0.3 }}
+                transition={{ ease: 'easeOut', duration: 0.2 }}
               />
             </div>
           </motion.div>
         )}
 
-        {/* Action Trigger Buttons */}
+        {/* "Process All Images" Trigger Button */}
         {queuedFiles.length > 0 && !scanning && (
           <div className="flex gap-3">
             <motion.button
@@ -1019,7 +1114,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
                 boxShadow: '0 0 24px rgba(16,185,129,0.25)',
               }}
             >
-              <Zap size={14} /> Process All ({queuedFiles.length} Photos)
+              <Zap size={14} /> Process All Images ({queuedFiles.length} Images)
             </motion.button>
             <button
               onClick={clearQueue}
@@ -1046,21 +1141,21 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
       </AnimatePresence>
 
       {/* ─────────────────────────────────────────────────────────────────── */}
-      {/* Batch Results Display Table                                         */}
+      {/* 3. Live Results Table                                               */}
       {/* ─────────────────────────────────────────────────────────────────── */}
-      {batchResults.length > 0 && (
+      {liveResults.length > 0 && (
         <motion.div variants={panelV} className="glass p-4 rounded-xl space-y-3 border border-emerald-900/30">
           
-          {/* Summary metrics header */}
+          {/* Header */}
           <div className="flex items-center justify-between gap-3 flex-wrap border-b border-gray-800 pb-3">
             <div className="flex items-center gap-2">
               <CheckCircle2 size={15} className="text-emerald-400" />
               <div>
                 <p className="font-jakarta text-[11px] font-bold text-emerald-300">
-                  Batch Ingestion Results ({batchResults.length} records processed)
+                  Live Classification Stream ({liveResults.length} records processed)
                 </p>
                 <p className="font-grotesk text-[8px] text-gray-500">
-                  All occurrences synced with telemetry &amp; persisted to master database
+                  MobileNetV3 Taxa Classification · Excess Green Index · Synced Telemetry Buffer
                 </p>
               </div>
             </div>
@@ -1070,13 +1165,13 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
                 onClick={exportBatchCSV}
                 className="px-3 py-1.5 rounded-lg bg-emerald-900/30 hover:bg-emerald-800/40 border border-emerald-600/40 text-emerald-300 font-jakarta text-[9px] font-semibold flex items-center gap-1.5 transition-colors"
               >
-                <FileSpreadsheet size={11} /> Export Batch CSV
+                <FileSpreadsheet size={11} /> Export CSV
               </button>
               <button
-                onClick={() => setBatchResults([])}
+                onClick={() => setLiveResults([])}
                 className="px-2.5 py-1.5 rounded-lg text-gray-600 hover:text-gray-400 text-[9px] font-jakarta transition-colors"
               >
-                Clear Results
+                Clear Stream
               </button>
             </div>
           </div>
@@ -1085,23 +1180,23 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
             <div className="glass p-2.5 rounded-xl text-center">
               <p className="font-jakarta text-[8px] text-gray-500 uppercase tracking-wider">Total Ingested</p>
-              <p className="font-grotesk text-base font-bold text-emerald-300">{batchResults.length}</p>
+              <p className="font-grotesk text-base font-bold text-emerald-300">{liveResults.length}</p>
             </div>
             <div className="glass p-2.5 rounded-xl text-center">
               <p className="font-jakarta text-[8px] text-gray-500 uppercase tracking-wider">Avg Softmax Confidence</p>
               <p className="font-grotesk text-base font-bold text-sky-300">
                 {(
-                  (batchResults.reduce((acc, r) => acc + (r.confidence_score ?? r.confidence ?? 0), 0) /
-                    (batchResults.length || 1)) * 100
+                  (liveResults.reduce((acc, r) => acc + (r.confidence_score ?? r.confidence ?? 0), 0) /
+                    (liveResults.length || 1)) * 100
                 ).toFixed(1)}%
               </p>
             </div>
             <div className="glass p-2.5 rounded-xl text-center">
-              <p className="font-jakarta text-[8px] text-gray-500 uppercase tracking-wider">Mean Excess Green (ExG)</p>
+              <p className="font-jakarta text-[8px] text-gray-500 uppercase tracking-wider">Mean ExG Value</p>
               <p className="font-grotesk text-base font-bold text-amber-300">
                 {(
-                  batchResults.reduce((acc, r) => acc + (r.excess_green_index ?? r.exg_index ?? 0), 0) /
-                  (batchResults.length || 1)
+                  liveResults.reduce((acc, r) => acc + (r.excess_green_index ?? r.exg_index ?? 0), 0) /
+                  (liveResults.length || 1)
                 ).toFixed(4)}
               </p>
             </div>
@@ -1119,7 +1214,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
               <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" />
               <input
                 type="text"
-                placeholder="Filter results by filename or species..."
+                placeholder="Search live results by filename or species..."
                 value={searchTerm}
                 onChange={e => setSearchTerm(e.target.value)}
                 className="w-full bg-[#0D1321] border border-gray-800 rounded-lg pl-7 pr-3 py-1.5 text-[9px] font-grotesk text-gray-200 placeholder-gray-600 outline-none focus:border-emerald-500/50"
@@ -1142,18 +1237,17 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
             </div>
           </div>
 
-          {/* Scrollable Results Table */}
-          <div className="overflow-x-auto rounded-xl border border-gray-800/80 max-h-[420px] scrollbar-thin scrollbar-thumb-emerald-900/40">
+          {/* Scrollable Live Results Table [ Thumbnail | Filename | Predicted Species / Zone | Softmax Confidence % | ExG Value | Status ] */}
+          <div className="overflow-x-auto rounded-xl border border-gray-800/80 max-h-[440px] scrollbar-thin scrollbar-thumb-emerald-900/40">
             <table className="w-full text-left border-collapse">
               <thead className="bg-[#0D1321] sticky top-0 z-10 text-[8px] font-jakarta uppercase tracking-wider text-gray-500 border-b border-gray-800">
                 <tr>
-                  <th className="py-2.5 px-3"># / Status</th>
-                  <th className="py-2.5 px-3">Specimen Filename</th>
-                  <th className="py-2.5 px-3">Predicted Taxa / Species</th>
-                  <th className="py-2.5 px-3">Zone</th>
-                  <th className="py-2.5 px-3">Softmax Conf.</th>
-                  <th className="py-2.5 px-3">ExG Index</th>
-                  <th className="py-2.5 px-3">Matched Microclimate Context</th>
+                  <th className="py-2.5 px-3">Thumbnail</th>
+                  <th className="py-2.5 px-3">Filename</th>
+                  <th className="py-2.5 px-3">Predicted Species / Zone</th>
+                  <th className="py-2.5 px-3">Softmax Confidence %</th>
+                  <th className="py-2.5 px-3">ExG Value</th>
+                  <th className="py-2.5 px-3">Status</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-800/60 font-grotesk text-[10px]">
@@ -1161,58 +1255,57 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
                   const conf = r.confidence_score ?? r.confidence ?? 0;
                   const exg = r.excess_green_index ?? r.exg_index ?? null;
                   const taxa = r.species_prediction ?? r.predicted_class ?? 'Unclassified';
-                  const pt = r.paired_telemetry || r.environmental_telemetry_snapshot || {};
                   const isOk = r.status !== 'error';
+                  const filename = r.filename || r.original_filename || 'image.jpg';
 
                   return (
                     <tr key={r.image_id || idx} className="hover:bg-white/[0.02] transition-colors">
-                      {/* # / Status */}
+                      {/* Thumbnail */}
                       <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div className="flex items-center gap-1.5">
-                          {isOk ? (
-                            <CheckCircle2 size={12} className="text-emerald-400" />
+                        <div className="w-10 h-10 rounded-lg overflow-hidden border border-emerald-900/40 bg-black/60 flex items-center justify-center">
+                          {r.previewUrl ? (
+                            <img src={r.previewUrl} alt={filename} className="w-full h-full object-cover" />
                           ) : (
-                            <XCircle size={12} className="text-red-400" />
+                            <Camera size={14} className="text-emerald-500 opacity-60" />
                           )}
-                          <span className="font-mono text-[9px] text-gray-500">{idx + 1}</span>
                         </div>
                       </td>
 
-                      {/* Specimen Filename */}
+                      {/* Filename */}
                       <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div className="flex items-center gap-2">
-                          <Camera size={11} className="text-gray-500 shrink-0" />
-                          <span className="font-mono text-gray-200 font-semibold truncate max-w-[140px]">
-                            {r.filename || r.original_filename || 'image.jpg'}
+                        <div className="flex flex-col">
+                          <span className="font-mono text-gray-200 font-semibold truncate max-w-[160px]">
+                            {filename}
+                          </span>
+                          <span className="font-grotesk text-[8px] text-gray-600">
+                            #{r.image_id > 0 ? r.image_id : idx + 1}
                           </span>
                         </div>
                       </td>
 
-                      {/* Predicted Taxa */}
+                      {/* Predicted Species / Zone */}
                       <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div>
-                          <p className="font-jakarta text-emerald-200 font-semibold truncate max-w-[180px]">
-                            {taxa}
-                          </p>
-                          {r.taxonomy && (r.taxonomy.Family || r.taxonomy.family) && (
-                            <p className="font-grotesk text-[8px] text-gray-500 italic">
-                              {r.taxonomy.Family || r.taxonomy.family}
+                        <div className="flex items-center gap-2">
+                          <div>
+                            <p className="font-jakarta text-emerald-200 font-semibold truncate max-w-[180px]">
+                              {taxa}
                             </p>
-                          )}
+                            {r.taxonomy && (r.taxonomy.Family || r.taxonomy.family) && (
+                              <p className="font-grotesk text-[8px] text-gray-500 italic">
+                                {r.taxonomy.Family || r.taxonomy.family}
+                              </p>
+                            )}
+                          </div>
+                          <FocalZoneBadge zoneId={r.focal_zone || zone} />
                         </div>
                       </td>
 
-                      {/* Zone */}
-                      <td className="py-2.5 px-3 whitespace-nowrap">
-                        <FocalZoneBadge zoneId={r.focal_zone || zone} />
-                      </td>
-
-                      {/* Softmax Confidence */}
+                      {/* Softmax Confidence % */}
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         <div className="flex items-center gap-2">
-                          <div className="w-12 h-1.5 rounded-full bg-gray-800 overflow-hidden">
+                          <div className="w-14 h-1.5 rounded-full bg-gray-800 overflow-hidden">
                             <div
-                              className="h-full bg-sky-400"
+                              className="h-full bg-gradient-to-r from-sky-500 to-emerald-400"
                               style={{ width: `${Math.min(100, Math.round(conf * 100))}%` }}
                             />
                           </div>
@@ -1222,11 +1315,11 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
                         </div>
                       </td>
 
-                      {/* ExG Index */}
+                      {/* ExG Value */}
                       <td className="py-2.5 px-3 whitespace-nowrap">
                         {exg != null ? (
                           <span
-                            className={`inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-mono font-bold ${
+                            className={`inline-flex items-center px-2 py-0.5 rounded text-[9px] font-mono font-bold ${
                               exg > 0
                                 ? 'bg-emerald-950 text-emerald-300 border border-emerald-700/40'
                                 : 'bg-red-950 text-red-300 border border-red-700/40'
@@ -1239,33 +1332,17 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
                         )}
                       </td>
 
-                      {/* Matched Microclimate Context */}
+                      {/* Status */}
                       <td className="py-2.5 px-3 whitespace-nowrap">
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          {(pt.temperature != null || pt.temperature_c != null) && (
-                            <span className="bg-orange-950/50 border border-orange-700/30 text-orange-300 text-[8px] px-1.5 py-0.5 rounded font-mono">
-                              🌡️ {Number(pt.temperature ?? pt.temperature_c).toFixed(1)}°C
-                            </span>
-                          )}
-                          {(pt.humidity != null || pt.humidity_percent != null) && (
-                            <span className="bg-sky-950/50 border border-sky-700/30 text-sky-300 text-[8px] px-1.5 py-0.5 rounded font-mono">
-                              💧 {Number(pt.humidity ?? pt.humidity_percent).toFixed(1)}%
-                            </span>
-                          )}
-                          {(pt.light != null || pt.light_lux != null) && (
-                            <span className="bg-amber-950/50 border border-amber-700/30 text-amber-300 text-[8px] px-1.5 py-0.5 rounded font-mono">
-                              ☀️ {Number(pt.light ?? pt.light_lux).toFixed(0)}lx
-                            </span>
-                          )}
-                          {(pt.sound != null || pt.sound_db != null) && (
-                            <span className="bg-emerald-950/50 border border-emerald-700/30 text-emerald-300 text-[8px] px-1.5 py-0.5 rounded font-mono">
-                              🔊 {Number(pt.sound ?? pt.sound_db).toFixed(0)}dB
-                            </span>
-                          )}
-                          {!Object.keys(pt).length && (
-                            <span className="text-gray-600 text-[8px] italic">Baseline Interpolated</span>
-                          )}
-                        </div>
+                        {isOk ? (
+                          <span className="inline-flex items-center gap-1 bg-emerald-950/60 text-emerald-300 border border-emerald-600/40 px-2 py-0.5 rounded-full text-[8px] font-jakarta font-semibold">
+                            <Check size={9} /> Fused
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 bg-red-950/60 text-red-300 border border-red-600/40 px-2 py-0.5 rounded-full text-[8px] font-jakarta font-semibold">
+                            <XCircle size={9} /> Error
+                          </span>
+                        )}
                       </td>
                     </tr>
                   );
@@ -1276,11 +1353,11 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
         </motion.div>
       )}
 
-      {/* Live micro-climate context banner when no batch results yet */}
-      {batchResults.length === 0 && latestReading && (
+      {/* Live micro-climate context baseline banner when no live results yet */}
+      {liveResults.length === 0 && latestReading && (
         <motion.div variants={panelV} className="glass p-4 rounded-xl border border-emerald-900/20 space-y-2">
           <p className="font-jakarta text-[9px] text-gray-600 uppercase tracking-widest flex items-center gap-1.5">
-            <Activity size={10} className="text-emerald-500" />Live Micro-Climate Baseline (latest ESP32 telemetry)
+            <Activity size={10} className="text-emerald-500" />Live Micro-Climate Baseline (latest ESP32 telemetry buffer)
           </p>
           <div className="grid grid-cols-3 xl:grid-cols-6 gap-2">
             {ENV_PARAMS.map(({ key, label, unit, color, Icon }) => (
@@ -1299,6 +1376,7 @@ function GroundPhotoTab({ geoCoords, readings, onScanComplete }) {
     </motion.div>
   );
 }
+
 
 
 /* ─────────────────────────────────────────────────────────────────────────── */
