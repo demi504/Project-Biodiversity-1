@@ -759,9 +759,13 @@ def build_dwc_record(
     lat   = zm["lat"]
     lon   = zm["lon"]
 
-    # If PlantNet failed and we have a curated fallback species → use it
+    # If PlantNet failed or unresolvable and we have a curated fallback species → use fallback taxonomy
     if taxonomy.get("enrichment_status") != "enriched" and fallback_species:
-        taxonomy = {**fallback_species, **taxonomy}   # fallback provides taxonomy, orig keeps conf
+        conf = taxonomy.get("aiClassificationConfidence", 0.0)
+        enrich_st = taxonomy.get("enrichment_status", "fallback")
+        taxonomy = dict(fallback_species)
+        taxonomy["aiClassificationConfidence"] = conf
+        taxonomy["enrichment_status"] = enrich_st
 
     event_dt = image_ts or datetime.now(timezone.utc)
     event_id = f"UNIBEN-{zone}-{event_dt.strftime('%Y%m%d')}-{record_index:04d}"
@@ -1099,8 +1103,8 @@ def run_pipeline() -> None:
             result["record"] = rec
             result["zone"] = zone
             result["fusion_tier"] = fusion_tier
-            result["conf"] = taxonomy.get("aiClassificationConfidence", 0.0)
-            result["sci_name"] = taxonomy.get("scientificName", "?")
+            result["conf"] = rec.get("aiClassificationConfidence", 0.0)
+            result["sci_name"] = rec.get("scientificName", "?")
             result["enrich"] = taxonomy.get("enrichment_status", "?")
         except Exception as exc:
             result["error"] = str(exc)
@@ -1111,7 +1115,7 @@ def run_pipeline() -> None:
     enriched_count = 0
     fallback_count = 0
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         futures = {
             executor.submit(_process_one, (i, p)): i
             for i, p in enumerate(image_paths)
